@@ -1,5 +1,5 @@
 use crate::ipc::{Connection, ConnectionTmpl};
-#[cfg(all(windows, not(feature = "flutter")))]
+#[cfg(windows)]
 use hbb_common::sha2::{Digest, Sha256};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use hbb_common::{anyhow, bail, log, ResultType};
@@ -12,7 +12,7 @@ use hbb_common::{
 use parity_tokio_ipc::SecurityAttributes;
 #[cfg(windows)]
 use std::io;
-#[cfg(all(windows, not(feature = "flutter")))]
+#[cfg(windows)]
 use std::io::Read;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt;
@@ -116,24 +116,17 @@ fn windows_portable_service_ipc_allows_logon_helper_executable(
     if postfix != "_portable_service" {
         return false;
     }
-    #[cfg(feature = "flutter")]
-    {
-        false
-    }
-    #[cfg(not(feature = "flutter"))]
-    {
-        let Some((_, expected)) = crate::platform::windows::portable_service_logon_helper_paths()
-        else {
-            return false;
-        };
-        let Ok(expected) = fs::canonicalize(expected) else {
-            return false;
-        };
-        let Ok(current_exe) = current_exe_canonical_path() else {
-            return false;
-        };
-        portable_service_helper_is_trusted(_peer_exe, &expected, &current_exe)
-    }
+    let Some((_, expected)) = crate::platform::windows::portable_service_logon_helper_paths()
+    else {
+        return false;
+    };
+    let Ok(expected) = fs::canonicalize(expected) else {
+        return false;
+    };
+    let Ok(current_exe) = current_exe_canonical_path() else {
+        return false;
+    };
+    portable_service_helper_is_trusted(_peer_exe, &expected, &current_exe)
 }
 
 #[cfg(windows)]
@@ -406,7 +399,7 @@ fn os_str_eq_ignore_ascii_case(
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
-#[cfg(all(windows, not(feature = "flutter")))]
+#[cfg(windows)]
 #[inline]
 fn file_sha256(path: &Path) -> ResultType<[u8; 32]> {
     let mut file = fs::File::open(path)?;
@@ -422,7 +415,7 @@ fn file_sha256(path: &Path) -> ResultType<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-#[cfg(all(windows, not(feature = "flutter")))]
+#[cfg(windows)]
 #[inline]
 fn portable_service_helper_is_trusted(
     peer_exe: &Path,
@@ -1023,10 +1016,10 @@ mod tests {
         ));
     }
 
-    #[cfg(all(windows, not(feature = "flutter")))]
+    #[cfg(windows)]
     struct TempDirGuard(std::path::PathBuf);
 
-    #[cfg(all(windows, not(feature = "flutter")))]
+    #[cfg(windows)]
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -1034,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(windows, not(feature = "flutter")))]
+    #[cfg(windows)]
     fn test_portable_service_helper_trust_requires_content_match() {
         let unique = format!(
             "rustdesk-portable-helper-trust-test-{}-{}",
@@ -1060,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(windows, not(feature = "flutter")))]
+    #[cfg(windows)]
     fn test_portable_service_helper_trust_accepts_matching_content() {
         let unique = format!(
             "rustdesk-portable-helper-trust-match-test-{}-{}",

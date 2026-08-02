@@ -11,7 +11,7 @@ use hbb_common::fs::serialize_transfer_job;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::tokio::sync::mpsc::unbounded_channel;
 use hbb_common::{
-    allow_err, bail,
+    allow_err,
     config::{
         keys::{OPTION_ENABLE_PERM_CHANGE_IN_ACCEPT_WINDOW, OPTION_FILE_TRANSFER_MAX_FILES},
         option2bool, Config,
@@ -30,7 +30,7 @@ use hbb_common::{
 #[cfg(target_os = "windows")]
 use hbb_common::{config::keys::*, tokio::sync::Mutex as TokioMutex};
 use serde_derive::Serialize;
-#[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 use std::iter::FromIterator;
 #[cfg(not(any(target_os = "ios")))]
 use std::path::PathBuf;
@@ -441,7 +441,7 @@ pub fn switch_permission_all(name: String, enabled: bool) {
     }
 }
 
-#[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 #[inline]
 pub fn get_clients_state() -> String {
     let clients = CLIENTS.read().unwrap();
@@ -460,15 +460,6 @@ pub fn get_clients_length() -> usize {
 pub fn has_active_clients() -> bool {
     let clients = CLIENTS.read().unwrap();
     clients.values().any(|c| !c.disconnected)
-}
-
-#[inline]
-#[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn switch_back(id: i32) {
-    if let Some(client) = CLIENTS.read().unwrap().get(&id) {
-        allow_err!(client.tx.send(Data::SwitchSidesBack));
-    };
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -652,15 +643,6 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                 }
                                 Data::DataPortableService(ipc::DataPortableService::CmShowElevation(show)) => {
                                     self.cm.show_elevation(show);
-                                }
-                                Data::StartVoiceCall => {
-                                    self.cm.voice_call_started(self.conn_id);
-                                }
-                                Data::VoiceCallIncoming => {
-                                    self.cm.voice_call_incoming(self.conn_id);
-                                }
-                                Data::CloseVoiceCall(reason) => {
-                                    self.cm.voice_call_closed(self.conn_id, reason.as_str());
                                 }
                                 #[cfg(target_os = "windows")]
                                 Data::ClipboardNonFile(_) => {
@@ -940,15 +922,6 @@ pub async fn start_listen<T: InvokeUiCM>(
             }
             Some(Data::Close) => {
                 break;
-            }
-            Some(Data::StartVoiceCall) => {
-                cm.voice_call_started(current_id);
-            }
-            Some(Data::VoiceCallIncoming) => {
-                cm.voice_call_incoming(current_id);
-            }
-            Some(Data::CloseVoiceCall(reason)) => {
-                cm.voice_call_closed(current_id, reason.as_str());
             }
             None => {
                 break;
@@ -1661,44 +1634,11 @@ pub fn elevate_portable(_id: i32) {
     }
 }
 
-#[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
-#[inline]
-pub fn handle_incoming_voice_call(id: i32, accept: bool) {
-    if let Some(client) = CLIENTS.read().unwrap().get(&id) {
-        // Not handled in iOS yet.
-        #[cfg(not(any(target_os = "ios")))]
-        allow_err!(client.tx.send(Data::VoiceCallResponse(accept)));
-    };
-}
-
-#[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
-#[inline]
-pub fn close_voice_call(id: i32) {
-    if let Some(client) = CLIENTS.read().unwrap().get(&id) {
-        // Not handled in iOS yet.
-        #[cfg(not(any(target_os = "ios")))]
-        allow_err!(client.tx.send(Data::CloseVoiceCall("".to_owned())));
-    };
-}
-
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn quit_cm() {
     // in case of std::process::exit not work
     log::info!("quit cm");
     CLIENTS.write().unwrap().clear();
-    // `quit_gui()` ends the process on Windows and macOS, but on Linux it calls
-    // `gtk_main_quit()`, which has no effect in the Flutter connection manager:
-    // `flutter/linux/main.cc` runs `g_application_run()` (GtkApplication), so
-    // `gtk_main()` is never called. Exit directly instead, otherwise this
-    // process keeps running while no longer serving the `_cm` ipc endpoint, so
-    // the server can't reuse it and spawns one more connection manager.
-    //
-    // NOTE: a client merely disconnecting does not come here, the Flutter side
-    // closes the window then, so this is a fallback rather than an explanation
-    // for the stale processes of #15698.
-    #[cfg(all(target_os = "linux", feature = "flutter"))]
-    std::process::exit(0);
-    #[cfg(not(all(target_os = "linux", feature = "flutter")))]
     crate::platform::quit_gui();
 }
 

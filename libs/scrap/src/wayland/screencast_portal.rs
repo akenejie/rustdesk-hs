@@ -23,6 +23,7 @@ pub trait OrgFreedesktopPortalScreenCast {
         session_handle: dbus::Path,
         options: arg::PropMap,
     ) -> Result<arg::OwnedFd, dbus::Error>;
+    #[allow(dead_code)]
     fn available_source_types(&self) -> Result<u32, dbus::Error>;
     fn available_cursor_modes(&self) -> Result<u32, dbus::Error>;
     fn version(&self) -> Result<u32, dbus::Error>;

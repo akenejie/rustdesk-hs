@@ -1,0 +1,150 @@
+name: Build
+
+# Runtime environment controls which registry/overlay bits vcpkg uses.
+env:
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca3ac877409c66bb93c0" # vcpkg baseline, keep in sync with vcpkg.json
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+
+jobs:
+  build:
+    name: ${{ matrix.id }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x86_64
+            os: ubuntu-24.04
+            artifact: rustdesk-linux-x86_64
+          - id: windows-x86_64
+            os: windows-2022
+            artifact: rustdesk-windows-x86_64
+          - id: macos-x86_64
+            os: macos-13
+            artifact: rustdesk-macos-x86_64
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # bindgen (used by magnum-opus etc.) needs libclang.
+      - name: Install LLVM (libclang for bindgen)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "16"
+
+      - name: (Linux) install system prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get -y update
+          sudo apt-get install -y \
+            cmake gcc g++ clang nasm wget perl \
+            libpam0g-dev libasound2-dev libunwind-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgtk-3-dev libpulse-dev libva-dev libvdpau-dev \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxdo-dev libxkbcommon-dev libjpeg-turbo8-dev \
+            libvpx-dev libaom-dev libopus-dev libyuv-dev \
+            libdbus-1-dev libsystemd-dev libsndfile1-dev libmp3lame-dev liblzma-dev
+
+      - name: (macOS) Install system prerequisites
+        if: runner.os == 'macOS'
+        run: brew install nasm yasm automake autoconf libtool
+
+      # vcpkg provides the codec/system libs on Windows/macOS where there is
+      # no system package manager. On Linux the crates use pkg-config instead,
+      # so vcpkg is intentionally only set up for Windows/macOS.
+      - name: (Windows/macOS) Setup vcpkg (cached)
+        if: runner.os != 'Linux'
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: ${{ runner.os == 'Windows' && 'C:\vcpkg' || '/opt/artifacts/vcpkg' }}
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+
+      - name: (Windows/macOS) Install vcpkg dependencies
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          "$VCPKG_ROOT/vcpkg" install --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Set versions as environment variables
+        shell: bash
+        run: |
+          echo "RUSTDESK_VERSION=${RUSTDESK_VERSION:-${{ github.ref_name }}}" >> "$GITHUB_ENV"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        shell: bash
+        run: |
+          cargo build --release --bin rustdesk-hs
+
+      - name: (Linux) Prepare portable artifact
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cp target/release/rustdesk-hs dist/rustdesk-hs
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C dist rustdesk-hs
+
+      - name: (Windows) Prepare portable artifact
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/rustdesk-hs.exe dist/rustdesk-hs.exe
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C dist rustdesk-hs.exe
+
+      - name: (macOS) Prepare portable artifact
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          cp target/release/rustdesk-hs dist/rustdesk-hs
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C dist rustdesk-hs
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release assets
+    needs: build
+    # Only run when a repository release is created or on a tag push.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.run_id }}
+          path: dist
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

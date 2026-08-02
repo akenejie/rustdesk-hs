@@ -23,7 +23,7 @@ use gstreamer_app::AppSink;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 
-use hbb_common::{bail, config, platform::linux::CMD_SH, serde_json, tokio, ResultType};
+use hbb_common::{bail, config, platform::linux::CMD_SH, serde_json, ResultType};
 
 use super::capturable::PixelProvider;
 use super::capturable::{Capturable, Recorder};
@@ -507,7 +507,7 @@ where
     })
 }
 
-pub fn get_portal(conn: &SyncConnection) -> Proxy<&SyncConnection> {
+pub fn get_portal(conn: &SyncConnection) -> Proxy<'_, &SyncConnection> {
     conn.with_proxy(
         "org.freedesktop.portal.Desktop",
         "/org/freedesktop/portal/desktop",

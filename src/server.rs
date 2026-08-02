@@ -8,8 +8,6 @@ use std::{
 use bytes::Bytes;
 
 pub use connection::*;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use hbb_common::config::Config2;
 use hbb_common::tcp::{self, new_listener};
 use hbb_common::{
     allow_err,
@@ -32,7 +30,6 @@ use video_service::VideoSource;
 
 use crate::ipc::Data;
 
-pub mod audio_service;
 #[cfg(target_os = "windows")]
 pub mod terminal_helper;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -75,9 +72,6 @@ mod service;
 mod video_qos;
 pub mod video_service;
 
-#[cfg(all(target_os = "windows", feature = "flutter"))]
-pub mod printer_service;
-
 pub type Childs = Arc<Mutex<Vec<std::process::Child>>>;
 type ConnMap = HashMap<i32, ConnInner>;
 
@@ -86,13 +80,6 @@ pub struct ConnectionMeta {
     pub control_permissions: Option<ControlPermissions>,
     pub controlled_context: Option<ControlledContext>,
 }
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-const CONFIG_SYNC_INTERVAL_SECS: f32 = 0.3;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-// 3s is enough for at least one initial sync attempt:
-// 0.3s backoff + up to 1s connect timeout + up to 1s response timeout.
-const CONFIG_SYNC_INITIAL_WAIT_SECS: u64 = 3;
 
 lazy_static::lazy_static! {
     pub static ref CHILD_PROCESS: Childs = Default::default();
@@ -121,7 +108,6 @@ pub fn new() -> ServerPtr {
         services: HashMap::new(),
         id_count: hbb_common::rand::random::<i32>() % 1000 + 1000, // ensure positive
     };
-    server.add_service(Box::new(audio_service::new()));
     #[cfg(not(target_os = "ios"))]
     {
         server.add_service(Box::new(display_service::new()));
@@ -145,20 +131,6 @@ pub fn new() -> ServerPtr {
             }
             #[cfg(not(target_os = "linux"))]
             server.add_service(Box::new(input_service::new_window_focus()));
-        }
-    }
-    #[cfg(all(target_os = "windows", feature = "flutter"))]
-    {
-        match printer_service::init(&crate::get_app_name()) {
-            Ok(()) => {
-                log::info!("printer service initialized");
-                server.add_service(Box::new(printer_service::new(
-                    printer_service::NAME.to_owned(),
-                )));
-            }
-            Err(e) => {
-                log::error!("printer service init failed: {}", e);
-            }
         }
     }
     // Terminal service is created per connection, not globally
@@ -558,23 +530,8 @@ pub fn check_zombie() {
 /// * `is_server` - Whether the current client is definitely the server.
 /// If true, the server will be started.
 /// Otherwise, client will check if there's already a server and start one if not.
-#[cfg(any(target_os = "android", target_os = "ios"))]
 #[tokio::main]
-pub async fn start_server(_is_server: bool) {
-    crate::RendezvousMediator::start_all().await;
-}
-
-/// Start the host server that allows the remote peer to control the current machine.
-///
-/// # Arguments
-///
-/// * `is_server` - Whether the current client is definitely the server.
-/// If true, the server will be started.
-/// Otherwise, client will check if there's already a server and start one if not.
-/// * `no_server` - If `is_server` is false, whether to start a server if not found.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-#[tokio::main]
-pub async fn start_server(is_server: bool, no_server: bool) {
+pub async fn start_server() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -587,254 +544,17 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         hbb_common::platform::windows::start_cpu_performance_monitor();
     });
 
-    if is_server {
-        crate::common::set_server_running(true);
-        std::thread::spawn(move || {
-            if let Err(err) = crate::ipc::start("") {
-                log::error!("Failed to start ipc: {}", err);
-                if crate::is_server() {
-                    log::error!("ipc is occupied by another process, try kill it");
-                    std::thread::spawn(stop_main_window_process).join().ok();
-                }
-                std::process::exit(-1);
-            }
-        });
-        input_service::fix_key_down_timeout_loop();
-        #[cfg(target_os = "linux")]
-        if input_service::wayland_use_uinput() {
-            allow_err!(input_service::setup_uinput(0, 1920, 0, 1080).await);
-        }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        wait_initial_config_sync().await;
-        #[cfg(target_os = "windows")]
-        crate::platform::try_kill_broker();
-        #[cfg(feature = "hwcodec")]
-        scrap::hwcodec::start_check_process();
-        crate::RendezvousMediator::start_all().await;
-    } else {
-        match crate::ipc::connect(1000, "").await {
-            Ok(mut conn) => {
-                if conn.send(&Data::SyncConfig(None)).await.is_ok() {
-                    if let Ok(Some(data)) = conn.next_timeout(1000).await {
-                        match data {
-                            Data::SyncConfig(Some(configs)) => {
-                                let (config, config2) = *configs;
-                                if Config::set(config) {
-                                    log::info!("config synced");
-                                }
-                                if Config2::set(config2) {
-                                    log::info!("config2 synced");
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                #[cfg(feature = "hwcodec")]
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
-                crate::ipc::client_get_hwcodec_config_thread(0);
-            }
-            Err(err) => {
-                log::info!("server not started: {err:?}, no_server: {no_server}");
-                if no_server {
-                    hbb_common::sleep(1.0).await;
-                    std::thread::spawn(|| start_server(false, true));
-                } else {
-                    log::info!("try start server");
-                    std::thread::spawn(|| start_server(true, false));
-                }
-            }
-        }
+    crate::common::set_server_running(true);
+    input_service::fix_key_down_timeout_loop();
+    #[cfg(target_os = "linux")]
+    if input_service::wayland_use_uinput() {
+        allow_err!(input_service::setup_uinput(0, 1920, 0, 1080).await);
     }
+    #[cfg(target_os = "windows")]
+    crate::platform::try_kill_broker();
+    #[cfg(feature = "hwcodec")]
+    scrap::hwcodec::start_check_process();
+    crate::rendezvous_mediator::start_all().await;
 }
 
-#[cfg(target_os = "macos")]
-#[tokio::main(flavor = "current_thread")]
-pub async fn start_ipc_url_server() {
-    log::debug!("Start an ipc server for listening to url schemes");
-    match crate::ipc::new_listener("_url").await {
-        Ok(mut incoming) => {
-            while let Some(Ok(conn)) = incoming.next().await {
-                let mut conn = crate::ipc::Connection::new(conn);
-                match conn.next_timeout(1000).await {
-                    Ok(Some(data)) => match data {
-                        #[cfg(feature = "flutter")]
-                        Data::UrlLink(url) => {
-                            let mut m = HashMap::new();
-                            m.insert("name", "on_url_scheme_received");
-                            m.insert("url", url.as_str());
-                            let event = serde_json::to_string(&m).unwrap_or("".to_owned());
-                            match crate::flutter::push_global_event(
-                                crate::flutter::APP_TYPE_MAIN,
-                                event,
-                            ) {
-                                None => log::warn!("No main window app found!"),
-                                Some(..) => {}
-                            }
-                        }
-                        _ => {
-                            log::warn!("An unexpected data was sent to the ipc url server.")
-                        }
-                    },
-                    Err(err) => {
-                        log::error!("{}", err);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Err(err) => {
-            log::error!("{}", err);
-        }
-    }
-}
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-async fn wait_initial_config_sync() {
-    if crate::platform::is_root() {
-        return;
-    }
-
-    // Non-server process should not block startup, but still keeps background sync/watch alive.
-    if !crate::is_server() {
-        tokio::spawn(async move {
-            sync_and_watch_config_dir(None).await;
-        });
-        return;
-    }
-
-    let (sync_done_tx, mut sync_done_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        sync_and_watch_config_dir(Some(sync_done_tx)).await;
-    });
-
-    // Server process waits up to N seconds for initial root->local sync to reduce stale-start window.
-    tokio::select! {
-        _ = &mut sync_done_rx => {
-        }
-        _ = tokio::time::sleep(Duration::from_secs(CONFIG_SYNC_INITIAL_WAIT_SECS)) => {
-            log::warn!(
-                "timed out waiting {}s for initial config sync, continue startup and keep syncing in background",
-                CONFIG_SYNC_INITIAL_WAIT_SECS
-            );
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-async fn sync_and_watch_config_dir(sync_done_tx: Option<tokio::sync::oneshot::Sender<()>>) {
-    let mut cfg0 = (Config::get(), Config2::get());
-    let mut synced = false;
-    let mut is_root_config_empty = false;
-    let mut sync_done_tx = sync_done_tx;
-    let tries = if crate::is_server() { 30 } else { 3 };
-    log::debug!("#tries of ipc service connection: {}", tries);
-    use hbb_common::sleep;
-    for i in 1..=tries {
-        sleep(i as f32 * CONFIG_SYNC_INTERVAL_SECS).await;
-        match crate::ipc::connect_service(1000).await {
-            Ok(mut conn) => {
-                if !synced {
-                    if conn.send(&Data::SyncConfig(None)).await.is_ok() {
-                        if let Ok(Some(data)) = conn.next_timeout(1000).await {
-                            match data {
-                                Data::SyncConfig(Some(configs)) => {
-                                    let (config, config2) = *configs;
-                                    let _chk = crate::ipc::CheckIfRestart::new();
-                                    #[cfg(target_os = "macos")]
-                                    let _chk_pk = crate::CheckIfResendPk::new();
-                                    if !config.is_empty() {
-                                        if cfg0.0 != config {
-                                            cfg0.0 = config.clone();
-                                            Config::set(config);
-                                            log::info!("sync config from root");
-                                        }
-                                        if cfg0.1 != config2 {
-                                            cfg0.1 = config2.clone();
-                                            Config2::set(config2);
-                                            log::info!("sync config2 from root");
-                                        }
-                                    } else {
-                                        // only on macos, because this issue was only reproduced on macos
-                                        #[cfg(target_os = "macos")]
-                                        {
-                                            // root config is empty, mark for sync in watch loop
-                                            // to prevent root from generating a new config on login screen
-                                            is_root_config_empty = true;
-                                        }
-                                    }
-                                    synced = true;
-                                    // Notify startup waiter once initial sync phase finishes successfully.
-                                    if let Some(tx) = sync_done_tx.take() {
-                                        let _ = tx.send(());
-                                    }
-                                }
-                                _ => {}
-                            };
-                        };
-                    }
-                    if !synced {
-                        log::warn!(
-                            "initial config sync from root failed, reconnecting to ipc_service"
-                        );
-                        continue;
-                    }
-                }
-
-                loop {
-                    sleep(CONFIG_SYNC_INTERVAL_SECS).await;
-                    let cfg = (Config::get(), Config2::get());
-                    let should_sync = cfg != cfg0 || (is_root_config_empty && !cfg.0.is_empty());
-                    if should_sync {
-                        if is_root_config_empty {
-                            log::info!("root config is empty, sync our config to root");
-                        } else {
-                            log::info!("config updated, sync to root");
-                        }
-                        match conn.send(&Data::SyncConfig(Some(cfg.clone().into()))).await {
-                            Err(e) => {
-                                log::error!("sync config to root failed: {}", e);
-                                match crate::ipc::connect_service(1000).await {
-                                    Ok(mut _conn) => {
-                                        conn = _conn;
-                                        log::info!("reconnected to ipc_service");
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            _ => {
-                                cfg0 = cfg;
-                                conn.next_timeout(1000).await.ok();
-                                is_root_config_empty = false;
-                            }
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                log::info!("#{} try: failed to connect to ipc_service", i);
-            }
-        }
-    }
-    // Notify startup waiter even when initial sync is skipped/failed, to avoid unnecessary waiting.
-    if let Some(tx) = sync_done_tx.take() {
-        let _ = tx.send(());
-    }
-    log::warn!("skipped config sync");
-}
-
-#[tokio::main(flavor = "current_thread")]
-pub async fn stop_main_window_process() {
-    // this may also kill another --server process,
-    // but --server usually can be auto restarted by --service, so it is ok
-    if let Ok(mut conn) = crate::ipc::connect(1000, "").await {
-        conn.send(&crate::ipc::Data::Close).await.ok();
-    }
-    #[cfg(windows)]
-    {
-        // in case above failure, e.g. zombie process
-        if let Err(e) = crate::platform::try_kill_rustdesk_main_window_process() {
-            log::error!("kill failed: {}", e);
-        }
-    }
-}

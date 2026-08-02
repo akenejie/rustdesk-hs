@@ -23,9 +23,6 @@ pub mod linux;
 #[cfg(target_os = "linux")]
 pub mod linux_desktop_manager;
 
-#[cfg(target_os = "linux")]
-pub mod gtk_sudo;
-
 #[cfg(all(
     not(all(target_os = "windows", not(target_pointer_width = "64"))),
     not(any(target_os = "android", target_os = "ios"))
@@ -33,17 +30,8 @@ pub mod gtk_sudo;
 use hbb_common::sysinfo::System;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::{message_proto::CursorData, sysinfo::Pid, ResultType};
-use std::sync::{Arc, Mutex};
 #[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
 pub const SERVICE_INTERVAL: u64 = 300;
-
-lazy_static::lazy_static! {
-    static ref INSTALLING_SERVICE: Arc<Mutex<bool>>= Default::default();
-}
-
-pub fn installing_service() -> bool {
-    INSTALLING_SERVICE.lock().unwrap().clone()
-}
 
 pub fn is_xfce() -> bool {
     #[cfg(target_os = "linux")]
@@ -118,24 +106,6 @@ pub fn get_wakelock(_display: bool) -> WakeLock {
     // sleep: prevent system from sleeping, even manually
     #[cfg(not(target_os = "android"))]
     return crate::platform::WakeLock::new(_display, true, false);
-}
-
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-pub(crate) struct InstallingService; // please use new
-
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-impl InstallingService {
-    pub fn new() -> Self {
-        *INSTALLING_SERVICE.lock().unwrap() = true;
-        Self
-    }
-}
-
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-impl Drop for InstallingService {
-    fn drop(&mut self) {
-        *INSTALLING_SERVICE.lock().unwrap() = false;
-    }
 }
 
 #[cfg(any(target_os = "android", target_os = "ios"))]

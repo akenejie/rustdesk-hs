@@ -1,0 +1,47 @@
+RustDesk-Headless-Server (Unofficial)
+=====================================
+
+This program is an unofficial, stripped-down derivative of RustDesk,
+reduced to a headless host server. It is distributed under the GNU
+Affero General Public License, Version 3 (See the "LICENCE" file or
+https://www.gnu.org/licenses/agpl-3.0.en.html for the full text).
+
+Repository: rustdesk-hs
+
+Origin
+------
+"RustDesk" is copyright (C) by the RustDesk project and its contributors
+(Purslane Tech Pte. Ltd. and others). RustDesk is licensed under the GNU
+Affero General Public License v3.0 (AGPL-3.0). This project is a modified
+version of RustDesk and remains subject to AGPL-3.0.
+
+See the upstream project: https://github.com/rustdesk/rustdesk
+and the "hbb_common" library (submodule), an AGPL-3.0 component of the
+same project.
+
+Modifications / Headless rework
+-------------------------------
+The headless modifications (removal of external configuration-file
+dependency, networked-server-only behaviour, removal of temporary
+password / voice / audio subsystems, and the removal of other unused
+code paths) are:
+
+    Copyright (C) 2026 アケネＪ / Akenejie
+
+These modifications are licensed under the GNU Affero General Public
+License v3.0, see "LICENCE".
+
+Note per AGPL-3.0 section 13
+----------------------------
+This software is intended to operate as a network server (it listens on
+a TCP port). As required by section 13 of the AGPL-3.0, if this software
+is made available to other users over a network, the Corresponding Source
+of the complete, modified work must likewise be made available to those
+users. The primary source of this modified work is this repository,
+rustdesk-hs, published under the AGPL-3.0.
+
+Trademark notice
+----------------
+"RustDesk" is a trademark of its holders ("(Unofficial)" marker above).
+This project does not claim, and is not affiliated with, those trademark
+holders. Use of the RustDesk trademark is informational only.

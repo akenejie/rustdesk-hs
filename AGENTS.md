@@ -61,12 +61,6 @@
 * Do not make formatting-only changes.
 * Keep naming/style consistent with nearby code.
 
-### Be minimally invasive
-
-* Prefer purely additive changes: layer new (`#[cfg]`-gated) blocks or new functions around existing code instead of restructuring it. The ideal diff for a fix adds lines and modifies/deletes none.
-* Do not extract or reshape existing code just to enable your new code; look for a mechanism that leaves existing lines untouched (e.g. hide/show an existing object instead of refactoring its construction into a helper for rebuilding).
-* Put new logic in self-contained functions in the module it belongs to (platform-specific logic in `src/platform/`, with `use` inside the function body to avoid churning shared import blocks). Call sites in shared files (`src/tray.rs`, `src/core_main.rs`, `src/server/connection.rs`, …) should be thin one-line hooks.
-
 ## Localization (`src/lang/*.rs`)
 
 Each file is a `HashMap<key, translation>`. Layout:
@@ -84,15 +78,37 @@ When filling an empty entry, determine the source English text with this rule:
 
 Then translate that source into the file's target language (infer the language from the file's existing non-empty entries / filename).
 
+## Build
+
+### Prerequisites (Linux)
+
+```bash
+sudo apt install build-essential libx11-dev libxext-dev libxtst-dev \
+  libxfixes-dev libxcb1-dev libxcb-randr-dev libxcb-shm-dev \
+  libasound2-dev libpulse-dev libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev libvpx-dev \
+  libopus-dev libaom-dev libpam0g-dev libdbus-1-dev \
+  libsystemd-dev libsndfile1-dev libmp3lame-dev libxkbcommon-dev \
+  libjpeg-turbo8-dev libyuv-dev
+```
+
+### All platforms
+
+```
+cargo build --release
+```
+
+No extra flags, no env vars, no feature toggles.
+
+- **Linux**: dynamically linked against system libs (X11, GStreamer, PulseAudio). Build the binary on the oldest glibc you need to support for maximum portability.
+- **Windows**: MSVC `+crt-static` — single portable EXE.
+- **macOS**: standard Mach-O bundle.
+
+Note for Linux: the resulting binary depends on X11 and Wayland client libraries (GStreamer + PipeWire for Wayland capture), PulseAudio, and glibc. These are present on any standard desktop Linux.
+
 ### Translation hygiene
 
 * Only fill empty values. Never change keys, and never touch existing non-empty translations.
 * Preserve placeholders (`{}`) and escape sequences (`\n`, `\"`) exactly as in the source.
 * Do not translate brand or technical tokens: `RustDesk`, `Socks5`, `TLS`, `UAC`, `Wayland`, `X11`, `TCP`, `UDP`, `2FA`, `RDP`, `D3D`, etc.
 * Copy URL values (e.g. `doc_*` keys) verbatim from `en.rs`.
-
-### Adding new keys (feature work)
-
-* New English-text keys use sentence case, not Title Case: `Use ID whitelisting`, **not** `Use ID Whitelisting`. Acronyms (ID, IP, 2FA…) stay uppercase. Legacy Title-Case keys (e.g. `Use IP Whitelisting`) stay as-is — do not rename them.
-* Since the key itself is the English display text, a sentence-case key usually needs **no** `en.rs` entry; add one only when the display text must differ from the key (e.g. `*_tip` keys).
-* Append each new key to `template.rs` (with `""`) and to every `src/lang/*.rs` file (translated, or `""` if unsure), at the end of the list.

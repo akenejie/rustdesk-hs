@@ -1,5 +1,4 @@
-use super::{gtk_sudo, CursorData, ResultType};
-use desktop::Desktop;
+use super::{CursorData, ResultType};
 pub use hbb_common::platform::linux::*;
 use hbb_common::{
     allow_err,
@@ -20,10 +19,8 @@ use std::{
     process::{Child, Command},
     string::String,
     sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use terminfo::{capability as cap, Database};
 use wallpaper;
 
 pub const PA_SAMPLE_RATE: u32 = 48000;
@@ -35,27 +32,9 @@ struct ActiveUserLookupCache {
     username: String,
 }
 
-const INVALID_TERM_VALUES: [&str; 3] = ["", "unknown", "dumb"];
-const SHELL_PROCESSES: [&str; 4] = ["bash", "zsh", "fish", "sh"];
-
-// Terminal type constants
-const TERM_XTERM_256COLOR: &str = "xterm-256color";
-const TERM_SCREEN_256COLOR: &str = "screen-256color";
-const TERM_XTERM: &str = "xterm";
 
 lazy_static::lazy_static! {
     pub static ref IS_X11: bool = hbb_common::platform::linux::is_x11_or_headless();
-    // Cache for TERM value - once TERM_XTERM_256COLOR is found, reuse it directly
-    static ref CACHED_TERM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-    static ref DATABASE_XTERM_256COLOR: Option<Database> = {
-        match Database::from_name(TERM_XTERM_256COLOR) {
-            Ok(database) => Some(database),
-            Err(err) => {
-                log::error!("Failed to initialize {} database: {}", TERM_XTERM_256COLOR, err);
-                None
-            }
-        }
-    };
     static ref ACTIVE_USER_LOOKUP_CACHE: std::sync::Mutex<Option<ActiveUserLookupCache>> =
         std::sync::Mutex::new(None);
     // https://github.com/rustdesk/rustdesk/issues/13705
@@ -90,19 +69,6 @@ lazy_static::lazy_static! {
     };
 }
 
-#[inline]
-fn update_active_user_lookup_cache(desktop: &Desktop) {
-    if let Ok(mut cache) = ACTIVE_USER_LOOKUP_CACHE.lock() {
-        if desktop.uid.is_empty() || desktop.username.is_empty() {
-            *cache = None;
-        } else {
-            *cache = Some(ActiveUserLookupCache {
-                uid: desktop.uid.clone(),
-                username: desktop.username.clone(),
-            });
-        }
-    }
-}
 
 #[inline]
 fn get_active_user_id_name_from_cache() -> Option<(String, String)> {
@@ -431,474 +397,8 @@ pub fn get_cursor_data(hcursor: u64) -> ResultType<CursorData> {
     }
 }
 
-fn start_uinput_service() {
-    use crate::server::uinput::service;
-    std::thread::spawn(|| {
-        service::start_service_control();
-    });
-    std::thread::spawn(|| {
-        service::start_service_keyboard();
-    });
-    std::thread::spawn(|| {
-        service::start_service_mouse();
-    });
-}
 
-/// Suggests the best terminal type based on the environment.
-///
-/// The function prioritizes terminal types in the following order:
-/// 1. `screen-256color`: Preferred when running inside `tmux` or `screen` sessions,
-///    as these multiplexers often support advanced terminal features.
-/// 2. `xterm-256color`: Selected if the terminal supports 256 colors, which is
-///    suitable for modern terminal applications.
-/// 3. `xterm`: Used as a fallback for basic terminal compatibility.
-///
-/// Terminals like `linux` and `vt100` are excluded because they lack support for
-/// modern features required by many applications.
-fn suggest_best_term() -> String {
-    if is_running_in_tmux() || is_running_in_screen() {
-        return TERM_SCREEN_256COLOR.to_string();
-    }
-    if term_supports_256_colors(TERM_XTERM_256COLOR) {
-        return TERM_XTERM_256COLOR.to_string();
-    }
-    TERM_XTERM.to_string()
-}
 
-fn is_running_in_tmux() -> bool {
-    std::env::var("TMUX").is_ok()
-}
-
-fn is_running_in_screen() -> bool {
-    std::env::var("STY").is_ok()
-}
-
-fn supports_256_colors(db: &Database) -> bool {
-    db.get::<cap::MaxColors>().map_or(false, |n| n.0 >= 256)
-}
-
-fn term_supports_256_colors(term: &str) -> bool {
-    match term {
-        TERM_XTERM_256COLOR => DATABASE_XTERM_256COLOR
-            .as_ref()
-            .map_or(false, |db| supports_256_colors(db)),
-        _ => Database::from_name(term).map_or(false, |db| supports_256_colors(&db)),
-    }
-}
-
-fn get_cur_term(uid: &str) -> Option<String> {
-    // Check cache first - if TERM_XTERM_256COLOR was found before, reuse it
-    if let Ok(cache) = CACHED_TERM.lock() {
-        if let Some(ref cached) = *cache {
-            if cached == TERM_XTERM_256COLOR {
-                return Some(cached.clone());
-            }
-        }
-    }
-
-    if uid.is_empty() {
-        return None;
-    }
-
-    // Check current process environment
-    if let Ok(term) = std::env::var("TERM") {
-        if term == TERM_XTERM_256COLOR {
-            if let Ok(mut cache) = CACHED_TERM.lock() {
-                *cache = Some(term.clone());
-            }
-            return Some(term);
-        }
-    }
-
-    // Collect all TERM values from shell processes, looking for TERM_XTERM_256COLOR
-    let terms = get_all_term_values(uid);
-
-    // Prefer TERM_XTERM_256COLOR
-    if terms.iter().any(|t| t == TERM_XTERM_256COLOR) {
-        if let Ok(mut cache) = CACHED_TERM.lock() {
-            *cache = Some(TERM_XTERM_256COLOR.to_string());
-        }
-        return Some(TERM_XTERM_256COLOR.to_string());
-    }
-
-    // Return first valid TERM if no TERM_XTERM_256COLOR found
-    let fallback = terms.into_iter().next();
-    if let Some(ref term) = fallback {
-        log::debug!(
-            "TERM_XTERM_256COLOR not found, using fallback TERM: {}",
-            term
-        );
-    }
-    fallback
-}
-
-/// Get all TERM values from shell processes (bash, zsh, fish, sh).
-/// Returns a Vec of unique, valid TERM values.
-fn get_all_term_values(uid: &str) -> Vec<String> {
-    let Ok(uid_num) = uid.parse::<u32>() else {
-        return Vec::new();
-    };
-
-    // Build regex pattern to match shell processes using only argv[0] (the executable path)
-    // Pattern: match process name at start or after '/', followed by space or end
-    // e.g., "bash", "/bin/bash", "/usr/bin/zsh"
-    let shell_pattern = SHELL_PROCESSES
-        .iter()
-        .map(|p| format!(r"(^|/){p}(\s|$)"))
-        .collect::<Vec<_>>()
-        .join("|");
-    let Ok(re) = Regex::new(&shell_pattern) else {
-        return Vec::new();
-    };
-
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-
-    let mut terms = Vec::new();
-
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(pid_str) = file_name.to_str() else {
-            continue;
-        };
-        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-
-        let proc_path = entry.path();
-
-        // Check if process belongs to the specified uid
-        if let Ok(meta) = std::fs::metadata(&proc_path) {
-            use std::os::unix::fs::MetadataExt;
-            if meta.uid() != uid_num {
-                continue;
-            }
-        } else {
-            continue;
-        }
-
-        // Check cmdline matches process pattern
-        // /proc/<pid>/cmdline is a sequence of null-terminated strings; the first
-        // one (argv[0]) is the executable path. Match the regex only against that
-        // to avoid false positives from arguments (e.g., "python /path/to/bash-script.py").
-        let cmdline_path = proc_path.join("cmdline");
-        let Ok(cmdline) = std::fs::read(&cmdline_path) else {
-            continue;
-        };
-        let exe_end = cmdline
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(cmdline.len());
-        let exe_str = String::from_utf8_lossy(&cmdline[..exe_end]);
-        if !re.is_match(&exe_str) {
-            continue;
-        }
-
-        // Read environ and extract TERM
-        let environ_path = proc_path.join("environ");
-        let Ok(environ) = std::fs::read(&environ_path) else {
-            continue;
-        };
-
-        for part in environ.split(|&b| b == 0) {
-            if part.is_empty() {
-                continue;
-            }
-            if let Some(eq) = part.iter().position(|&b| b == b'=') {
-                let key_bytes = &part[..eq];
-                if key_bytes == b"TERM" {
-                    let val_bytes = &part[eq + 1..];
-                    let term = String::from_utf8_lossy(val_bytes).into_owned();
-                    if !INVALID_TERM_VALUES.contains(&term.as_str()) && !terms.contains(&term) {
-                        // Early return if we found the preferred term
-                        if term == TERM_XTERM_256COLOR {
-                            return vec![term];
-                        }
-                        terms.push(term);
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    terms
-}
-
-#[inline]
-fn try_start_server_(desktop: Option<&Desktop>) -> ResultType<Option<Child>> {
-    match desktop {
-        Some(desktop) => {
-            let mut envs = vec![];
-            if !desktop.display.is_empty() {
-                envs.push(("DISPLAY", desktop.display.clone()));
-            }
-            if !desktop.xauth.is_empty() {
-                envs.push(("XAUTHORITY", desktop.xauth.clone()));
-            }
-            if !desktop.wl_display.is_empty() {
-                envs.push(("WAYLAND_DISPLAY", desktop.wl_display.clone()));
-            }
-            if !desktop.home.is_empty() {
-                envs.push(("HOME", desktop.home.clone()));
-            }
-            if !desktop.dbus.is_empty() {
-                envs.push(("DBUS_SESSION_BUS_ADDRESS", desktop.dbus.clone()));
-            }
-            if let Ok(forced_display_server) =
-                std::env::var("RUSTDESK_FORCED_DISPLAY_SERVER")
-            {
-                if !forced_display_server.is_empty() {
-                    envs.push((
-                        "RUSTDESK_FORCED_DISPLAY_SERVER",
-                        forced_display_server,
-                    ));
-                }
-            }
-            envs.push((
-                "TERM",
-                get_cur_term(&desktop.uid).unwrap_or_else(|| suggest_best_term()),
-            ));
-            run_as_user(
-                vec!["--server"],
-                Some((desktop.uid.clone(), desktop.username.clone())),
-                envs,
-            )
-        }
-        None => Ok(Some(crate::run_me(vec!["--server"])?)),
-    }
-}
-
-#[inline]
-fn start_server(desktop: Option<&Desktop>, server: &mut Option<Child>) {
-    match try_start_server_(desktop) {
-        Ok(ps) => *server = ps,
-        Err(err) => {
-            log::error!("Failed to start server: {}", err);
-        }
-    }
-}
-
-fn stop_server(server: &mut Option<Child>) {
-    if let Some(mut ps) = server.take() {
-        allow_err!(ps.kill());
-        sleep_millis(30);
-        match ps.try_wait() {
-            Ok(Some(_status)) => {}
-            Ok(None) => {
-                let _res = ps.wait();
-            }
-            Err(e) => log::error!("error attempting to wait: {e}"),
-        }
-    }
-}
-
-fn set_x11_env(desktop: &Desktop) {
-    log::info!("DISPLAY: {}", desktop.display);
-    log::info!("XAUTHORITY: {}", desktop.xauth);
-    if !desktop.display.is_empty() {
-        std::env::set_var("DISPLAY", &desktop.display);
-    }
-    if !desktop.xauth.is_empty() {
-        std::env::set_var("XAUTHORITY", &desktop.xauth);
-    }
-}
-
-#[inline]
-fn stop_rustdesk_servers() {
-    let _ = run_cmds(&format!(
-        r##"ps -ef | grep -E '{} +--server' | awk '{{print $2}}' | xargs -r kill -9"##,
-        crate::get_app_name().to_lowercase(),
-    ));
-}
-
-#[inline]
-fn stop_subprocess() {
-    let _ = run_cmds(&format!(
-        r##"ps -ef | grep '/etc/{}/xorg.conf' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9"##,
-        crate::get_app_name().to_lowercase(),
-    ));
-    let _ = run_cmds(&format!(
-        r##"ps -ef | grep -E '{} +--cm-no-ui' | grep -v grep | awk '{{print $2}}' | xargs -r kill -9"##,
-        crate::get_app_name().to_lowercase(),
-    ));
-}
-
-fn should_start_server(
-    try_x11: bool,
-    is_display_changed: bool,
-    uid: &mut String,
-    desktop: &Desktop,
-    cm0: &mut bool,
-    last_restart: &mut Instant,
-    server: &mut Option<Child>,
-) -> bool {
-    let cm = get_cm();
-    let mut start_new = false;
-    let mut should_kill = false;
-
-    if desktop.is_headless() {
-        if !uid.is_empty() {
-            // From having a monitor to not having a monitor.
-            *uid = "".to_owned();
-            should_kill = true;
-        }
-    } else if is_display_changed || desktop.uid != *uid && !desktop.uid.is_empty() {
-        *uid = desktop.uid.clone();
-        if try_x11 {
-            set_x11_env(&desktop);
-        }
-        should_kill = true;
-    }
-
-    if !should_kill
-        && !cm
-        && ((*cm0 && last_restart.elapsed().as_secs() > 60)
-            || last_restart.elapsed().as_secs() > 3600)
-    {
-        let terminal_session_count = crate::ipc::get_terminal_session_count().unwrap_or(0);
-        if terminal_session_count > 0 {
-            // There are terminal sessions, so we don't restart the server.
-            // We also need to keep `cm0` unchanged, so that we can reach this branch the next time.
-            return false;
-        }
-        // restart server if new connections all closed, or every one hour,
-        // as a workaround to resolve "SpotUdp" (dns resolve)
-        // and x server get displays failure issue
-        should_kill = true;
-        log::info!("restart server");
-    }
-
-    if should_kill {
-        if let Some(ps) = server.as_mut() {
-            allow_err!(ps.kill());
-            sleep_millis(30);
-            *last_restart = Instant::now();
-        }
-    }
-
-    if let Some(ps) = server.as_mut() {
-        match ps.try_wait() {
-            Ok(Some(_)) => {
-                *server = None;
-                start_new = true;
-            }
-            _ => {}
-        }
-    } else {
-        start_new = true;
-    }
-    *cm0 = cm;
-    start_new
-}
-
-// to-do: stop_server(&mut user_server); may not stop child correctly
-// stop_rustdesk_servers() is just a temp solution here.
-fn force_stop_server() {
-    stop_rustdesk_servers();
-    sleep_millis(super::SERVICE_INTERVAL);
-}
-
-pub fn start_os_service() {
-    check_if_stop_service();
-    stop_rustdesk_servers();
-    stop_subprocess();
-    start_uinput_service();
-
-    std::thread::spawn(|| {
-        allow_err!(crate::ipc::start(crate::POSTFIX_SERVICE));
-    });
-
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    let (mut display, mut xauth): (String, String) = ("".to_owned(), "".to_owned());
-    let mut desktop = Desktop::default();
-    let mut sid = "".to_owned();
-    let mut uid = "".to_owned();
-    let mut server: Option<Child> = None;
-    let mut user_server: Option<Child> = None;
-    if let Err(err) = ctrlc::set_handler(move || {
-        r.store(false, Ordering::SeqCst);
-    }) {
-        println!("Failed to set Ctrl-C handler: {}", err);
-    }
-
-    let mut cm0 = false;
-    let mut last_restart = Instant::now();
-    while running.load(Ordering::SeqCst) {
-        desktop.refresh();
-        update_active_user_lookup_cache(&desktop);
-
-        // Duplicate logic here with should_start_server
-        // Login wayland will try to start a headless --server.
-        if desktop.username == "root" || desktop.is_login_wayland() {
-            // try kill subprocess "--server"
-            stop_server(&mut user_server);
-            // try start subprocess "--server"
-            // No need to check is_display_changed here.
-            if should_start_server(
-                true,
-                false,
-                &mut uid,
-                &desktop,
-                &mut cm0,
-                &mut last_restart,
-                &mut server,
-            ) {
-                stop_subprocess();
-                force_stop_server();
-                start_server(None, &mut server);
-            }
-        } else if desktop.username != "" {
-            // try kill subprocess "--server"
-            stop_server(&mut server);
-
-            let is_display_changed = desktop.display != display || desktop.xauth != xauth;
-            display = desktop.display.clone();
-            xauth = desktop.xauth.clone();
-
-            // try start subprocess "--server"
-            if should_start_server(
-                !desktop.is_wayland(),
-                is_display_changed,
-                &mut uid,
-                &desktop,
-                &mut cm0,
-                &mut last_restart,
-                &mut user_server,
-            ) {
-                stop_subprocess();
-                force_stop_server();
-                start_server(Some(&desktop), &mut user_server);
-            }
-        } else {
-            force_stop_server();
-            stop_server(&mut user_server);
-            stop_server(&mut server);
-        }
-
-        let keeps_headless = sid.is_empty() && desktop.is_headless();
-        let keeps_session = sid == desktop.sid;
-        if keeps_headless || keeps_session {
-            // for fixing https://github.com/rustdesk/rustdesk/issues/3129 to avoid too much dbus calling,
-            sleep_millis(500);
-        } else {
-            sleep_millis(super::SERVICE_INTERVAL);
-        }
-        if !desktop.is_headless() {
-            sid = desktop.sid.clone();
-        }
-    }
-
-    if let Some(ps) = user_server.take().as_mut() {
-        allow_err!(ps.kill());
-    }
-    if let Some(ps) = server.take().as_mut() {
-        allow_err!(ps.kill());
-    }
-    log::info!("Exit");
-}
 
 #[inline]
 /// Returns the cached active `(uid, username)` snapshot when available.
@@ -927,22 +427,6 @@ pub fn get_active_userid_fresh() -> String {
     get_values_of_seat0(&[1])[0].clone()
 }
 
-fn get_cm() -> bool {
-    // We use `CMD_PS` instead of `ps` to suppress some audit messages on some systems.
-    if let Ok(output) = Command::new(CMD_PS.as_str()).args(vec!["aux"]).output() {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if line.contains(&format!(
-                "{} --cm",
-                std::env::current_exe()
-                    .unwrap_or("".into())
-                    .to_string_lossy()
-            )) {
-                return true;
-            }
-        }
-    }
-    false
-}
 
 pub fn is_login_wayland() -> bool {
     let files = ["/etc/gdm3/custom.conf", "/etc/gdm/custom.conf"];
@@ -1401,23 +885,9 @@ fn get_env_from_pid(name: &str, pid: &str) -> String {
     }
 }
 
-#[link(name = "gtk-3")]
-extern "C" {
-    fn gtk_main_quit();
-}
-
-pub fn quit_gui() {
-    unsafe { gtk_main_quit() };
-}
-
-/*
-pub fn exec_privileged(args: &[&str]) -> ResultType<Child> {
-    Ok(Command::new("pkexec").args(args).spawn()?)
-}
-*/
+pub fn quit_gui() {}
 
 pub fn check_super_user_permission() -> ResultType<bool> {
-    gtk_sudo::run(vec!["echo"])?;
     Ok(true)
 }
 
@@ -1458,36 +928,8 @@ pub fn elevate(args: Vec<&str>) -> ResultType<bool> {
 }
 */
 
-type GtkSettingsPtr = *mut c_void;
-type GObjectPtr = *mut c_void;
-#[link(name = "gtk-3")]
-extern "C" {
-    // fn gtk_init(argc: *mut c_int, argv: *mut *mut c_char);
-    fn gtk_settings_get_default() -> GtkSettingsPtr;
-}
-
-#[link(name = "gobject-2.0")]
-extern "C" {
-    fn g_object_get(object: GObjectPtr, first_property_name: *const c_char, ...);
-}
-
 pub fn get_double_click_time() -> u32 {
-    // GtkSettings *settings = gtk_settings_get_default ();
-    // g_object_get (settings, "gtk-double-click-time", &double_click_time, NULL);
-    unsafe {
-        let mut double_click_time = 0u32;
-        let Ok(property) = std::ffi::CString::new("gtk-double-click-time") else {
-            return 0;
-        };
-        let settings = gtk_settings_get_default();
-        g_object_get(
-            settings,
-            property.as_ptr(),
-            &mut double_click_time as *mut u32,
-            0 as *const c_void,
-        );
-        double_click_time
-    }
+    400
 }
 
 #[inline]
@@ -1747,7 +1189,7 @@ mod desktop {
             }
             self.display = self
                 .display
-                .replace(&hbb_common::whoami::hostname(), "")
+                .replace(&hbb_common::whoami::fallible::hostname().unwrap_or_default(), "")
                 .replace("localhost", "");
         }
 
@@ -1997,120 +1439,6 @@ impl WakeLock {
     }
 }
 
-fn has_cmd(cmd: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .status()
-        .map(|x| x.success())
-        .unwrap_or_default()
-}
-
-pub fn run_cmds_privileged(cmds: &str) -> bool {
-    crate::platform::gtk_sudo::run(vec![cmds]).is_ok()
-}
-
-/// Spawn the current executable after a delay.
-///
-/// # Security
-/// The executable path is safely quoted using `shell_quote()` to prevent
-/// command injection vulnerabilities. The `secs` parameter is a u32, so it
-/// cannot contain malicious input.
-///
-/// # Arguments
-/// * `secs` - Number of seconds to wait before spawning
-pub fn run_me_with(secs: u32) {
-    let exe = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(e) => {
-            log::error!("Failed to get current exe: {}", e);
-            return;
-        }
-    };
-
-    // SECURITY: Use shell_quote to safely escape the executable path,
-    // preventing command injection even if the path contains special characters.
-    let exe_quoted = shell_quote(&exe.to_string_lossy());
-
-    // Spawn a background process that sleeps and then executes.
-    // The child process is automatically orphaned when parent exits,
-    // and will be adopted by init (PID 1).
-    Command::new(CMD_SH.as_str())
-        .arg("-c")
-        .arg(&format!("sleep {secs}; exec {exe_quoted}"))
-        .spawn()
-        .ok();
-}
-
-fn switch_service(stop: bool) -> String {
-    // SECURITY: Use trusted home directory lookup via getpwuid instead of $HOME env var
-    // to prevent confused-deputy attacks where an attacker manipulates environment variables.
-    let home = get_home_dir_trusted()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    Config::set_option("stop-service".into(), if stop { "Y" } else { "" }.into());
-    if !home.is_empty() && home != "/root" && !Config::get().is_empty() {
-        let app_name_lower = crate::get_app_name().to_lowercase();
-        let app_name0 = crate::get_app_name();
-        let config_subdir = format!(".config/{}", app_name_lower);
-
-        // SECURITY: Quote all paths to prevent shell injection from paths containing
-        // spaces, semicolons, or other special characters.
-        let src1 = shell_quote(&format!("{}/{}/{}.toml", home, config_subdir, app_name0));
-        let src2 = shell_quote(&format!("{}/{}/{}2.toml", home, config_subdir, app_name0));
-        let dst = shell_quote(&format!("/root/{}/", config_subdir));
-
-        format!("cp -f {} {}; cp -f {} {};", src1, dst, src2, dst)
-    } else {
-        "".to_owned()
-    }
-}
-
-pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
-    if !has_cmd("systemctl") {
-        // Failed when installed + flutter run + started by `show_new_window`.
-        return false;
-    }
-    log::info!("Uninstalling service...");
-    let cp = switch_service(true);
-    let app_name = crate::get_app_name().to_lowercase();
-    // systemctl kill rustdesk --tray, execute cp first
-    if !run_cmds_privileged(&format!(
-        "{cp} systemctl disable {app_name}; systemctl stop {app_name};"
-    )) {
-        Config::set_option("stop-service".into(), "".into());
-        return true;
-    }
-    // systemctl stop will kill child processes, below may not be executed.
-    if show_new_window {
-        run_me_with(2);
-    }
-    std::process::exit(0);
-}
-
-pub fn install_service() -> bool {
-    let _installing = crate::platform::InstallingService::new();
-    if !has_cmd("systemctl") {
-        return false;
-    }
-    log::info!("Installing service...");
-    let cp = switch_service(false);
-    let app_name = crate::get_app_name().to_lowercase();
-    if !run_cmds_privileged(&format!(
-        "{cp} systemctl enable {app_name}; systemctl start {app_name};"
-    )) {
-        Config::set_option("stop-service".into(), "Y".into());
-    }
-    true
-}
-
-fn check_if_stop_service() {
-    if Config::get_option("stop-service".into()) == "Y" {
-        let app_name = crate::get_app_name().to_lowercase();
-        allow_err!(run_cmds(&format!(
-            "systemctl disable {app_name}; systemctl stop {app_name}"
-        )));
-    }
-}
 
 pub fn check_autostart_config() -> ResultType<()> {
     // SECURITY: Use trusted home directory lookup via getpwuid instead of $HOME env var

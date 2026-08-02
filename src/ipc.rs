@@ -4,14 +4,10 @@ mod ipc_auth;
 #[path = "ipc/fs.rs"]
 mod ipc_fs;
 
-#[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use crate::plugin::ipc::Plugin;
 use crate::{
-    common::{is_server, CheckTestNatType},
+    common::{is_server},
     privacy_mode,
     privacy_mode::PrivacyModeState,
-    rendezvous_mediator::RendezvousMediator,
     ui_interface::{get_local_option, set_local_option},
 };
 use bytes::Bytes;
@@ -25,7 +21,7 @@ use hbb_common::{
     config::{self, keys::OPTION_ALLOW_WEBSOCKET, Config, Config2},
     futures::StreamExt as _,
     futures_util::sink::SinkExt,
-    log, password_security as password, timeout,
+    log, timeout,
     tokio::{
         self,
         io::{AsyncRead, AsyncWrite},
@@ -364,23 +360,7 @@ pub enum Data {
     Empty,
     Disconnected,
     DataPortableService(DataPortableService),
-    #[cfg(feature = "flutter")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    SwitchSidesRequest(String),
-    #[cfg(feature = "flutter")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    SwitchSidesUuid(String, String, Option<bool>),
-    #[cfg(feature = "flutter")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    SwitchSidesBack,
     UrlLink(String),
-    VoiceCallIncoming,
-    StartVoiceCall,
-    VoiceCallResponse(bool),
-    CloseVoiceCall(String),
-    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    Plugin(Plugin),
     #[cfg(windows)]
     SyncWinCpuUsage(Option<f64>),
     FileTransferLog((String, String)),
@@ -454,21 +434,12 @@ pub enum Data {
         result: Result<Vec<u8>, String>,
     },
     CheckHwcodec,
-    #[cfg(feature = "flutter")]
-    VideoConnCount(Option<usize>),
     // Although the key is not necessary, it is used to avoid hardcoding the key.
     WaylandScreencastRestoreToken((String, String)),
     HwCodecConfig(Option<String>),
     RemoveTrustedDevices(Vec<Bytes>),
     ClearTrustedDevices,
-    #[cfg(all(target_os = "windows", feature = "flutter"))]
-    PrinterData(Vec<u8>),
     InstallOption(Option<(String, String)>),
-    #[cfg(all(
-        feature = "flutter",
-        not(any(target_os = "android", target_os = "ios"))
-    ))]
-    ControllingSessionCount(usize),
     #[cfg(target_os = "linux")]
     TerminalSessionCount(usize),
     #[cfg(target_os = "windows")]
@@ -476,8 +447,6 @@ pub enum Data {
     SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
     #[cfg(target_os = "macos")]
     HasNoActiveConns(Option<bool>),
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    Whiteboard((String, crate::whiteboard::CustomEvent)),
     ControlPermissionsRemoteModify(Option<bool>),
     #[cfg(target_os = "windows")]
     FileTransferEnabledState(Option<bool>),
@@ -660,10 +629,7 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
 }
 
 pub struct CheckIfRestart {
-    stop_service: String,
     rendezvous_servers: Vec<String>,
-    audio_input: String,
-    voice_call_input: String,
     ws: String,
     disable_udp: String,
     allow_insecure_tls_fallback: String,
@@ -673,10 +639,7 @@ pub struct CheckIfRestart {
 impl CheckIfRestart {
     pub fn new() -> CheckIfRestart {
         CheckIfRestart {
-            stop_service: Config::get_option("stop-service"),
             rendezvous_servers: Config::get_rendezvous_servers(),
-            audio_input: Config::get_option("audio-input"),
-            voice_call_input: Config::get_option("voice-call-input"),
             ws: Config::get_option(OPTION_ALLOW_WEBSOCKET),
             disable_udp: Config::get_option(config::keys::OPTION_DISABLE_UDP),
             allow_insecure_tls_fallback: Config::get_option(
@@ -693,26 +656,8 @@ impl Drop for CheckIfRestart {
         // and restarting mediator is safe even https proxy is not used.
         let allow_insecure_tls_fallback_changed = self.allow_insecure_tls_fallback
             != Config::get_option(config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK);
-        if allow_insecure_tls_fallback_changed
-            || self.stop_service != Config::get_option("stop-service")
-            || self.rendezvous_servers != Config::get_rendezvous_servers()
-            || self.ws != Config::get_option(OPTION_ALLOW_WEBSOCKET)
-            || self.disable_udp != Config::get_option(config::keys::OPTION_DISABLE_UDP)
-            || self.api_server != Config::get_option("api-server")
-        {
-            if allow_insecure_tls_fallback_changed {
-                hbb_common::tls::reset_tls_cache();
-            }
-            RendezvousMediator::restart();
-        }
-        if self.audio_input != Config::get_option("audio-input") {
-            crate::audio_service::restart();
-        }
-        if self.voice_call_input != Config::get_option("voice-call-input") {
-            crate::audio_service::set_voice_call_input_device(
-                Some(Config::get_option("voice-call-input")),
-                true,
-            )
+        if allow_insecure_tls_fallback_changed {
+            hbb_common::tls::reset_tls_cache();
         }
     }
 }
@@ -793,13 +738,11 @@ async fn handle(data: Data, stream: &mut Connection) {
                 allow_err!(stream.send(&Data::Socks(Config::get_socks())).await);
             }
             Some(data) => {
-                let _nat = CheckTestNatType::new();
                 if data.proxy.is_empty() {
                     Config::set_socks(None);
                 } else {
                     Config::set_socks(Some(data));
                 }
-                RendezvousMediator::restart();
                 log::info!("socks updated");
             }
         },
@@ -816,38 +759,11 @@ async fn handle(data: Data, stream: &mut Connection) {
             }
             _ => {}
         },
-        #[cfg(feature = "flutter")]
-        Data::VideoConnCount(None) => {
-            let n = crate::server::AUTHED_CONNS
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|x| x.conn_type == crate::server::AuthConnType::Remote)
-                .count();
-            allow_err!(stream.send(&Data::VideoConnCount(Some(n))).await);
-        }
         Data::Config((name, value)) => match value {
             None => {
                 let value;
                 if name == "id" {
                     value = Some(Config::get_id());
-                } else if name == "temporary-password" {
-                    value = Some(password::temporary_password());
-                } else if name == "permanent-password-storage-and-salt" {
-                    let (storage, salt) = Config::get_local_permanent_password_storage_and_salt();
-                    value = Some(storage + "\n" + &salt);
-                } else if name == "permanent-password-set" {
-                    value = Some(if Config::has_permanent_password() {
-                        "Y".to_owned()
-                    } else {
-                        "N".to_owned()
-                    });
-                } else if name == "permanent-password-is-preset" {
-                    value = Some(if Config::is_using_preset_password() {
-                        "Y".to_owned()
-                    } else {
-                        "N".to_owned()
-                    });
                 } else if name == "salt" {
                     value = Some(Config::get_salt());
                 } else if name == "rendezvous_server" {
@@ -864,15 +780,6 @@ async fn handle(data: Data, stream: &mut Connection) {
                     } else {
                         None
                     };
-                } else if name == "hide_cm" {
-                    value = if crate::hbbs_http::sync::is_pro() || crate::common::is_custom_client()
-                    {
-                        Some(hbb_common::password_security::hide_cm().to_string())
-                    } else {
-                        None
-                    };
-                } else if name == "voice-call-input" {
-                    value = crate::audio_service::get_voice_call_input_device();
                 } else if name == "unlock-pin" {
                     value = Some(Config::get_unlock_pin());
                 } else if name == "trusted-devices" {
@@ -893,24 +800,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                         Config::set_key_confirmed(false);
                         Config::set_id(&value);
                     }
-                } else if name == "temporary-password" {
-                    password::update_temporary_password();
-                } else if name == "permanent-password" {
-                    if Config::is_disable_change_permanent_password() {
-                        log::warn!("Changing permanent password is disabled");
-                        updated = false;
-                    } else {
-                        updated = Config::set_permanent_password(&value);
-                    }
-                    // Explicitly ACK/NACK permanent-password writes. This allows UIs/FFI to
-                    // distinguish "accepted by daemon" vs "IPC send succeeded" without
-                    // reading back any secret.
-                    let ack = if updated { "Y" } else { "N" }.to_owned();
-                    allow_err!(stream.send(&Data::Config((name.clone(), Some(ack)))).await);
                 } else if name == "salt" {
                     Config::set_salt(&value);
-                } else if name == "voice-call-input" {
-                    crate::audio_service::set_voice_call_input_device(Some(value), true);
                 } else if name == "unlock-pin" {
                     Config::set_unlock_pin(&value);
                 } else {
@@ -928,7 +819,6 @@ async fn handle(data: Data, stream: &mut Connection) {
             }
             Some(value) => {
                 let _chk = CheckIfRestart::new();
-                let _nat = CheckTestNatType::new();
                 if let Some(v) = value.get("privacy-mode-impl-key") {
                     crate::privacy_mode::switch(v);
                 }
@@ -969,37 +859,6 @@ async fn handle(data: Data, stream: &mut Connection) {
         Data::TestRendezvousServer => {
             crate::test_rendezvous_server();
         }
-        Data::Deployed => {
-            crate::rendezvous_mediator::NEEDS_DEPLOY.store(false, Ordering::SeqCst);
-            crate::rendezvous_mediator::RendezvousMediator::restart();
-        }
-        #[cfg(feature = "flutter")]
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        Data::SwitchSidesRequest(id) => {
-            let uuid = uuid::Uuid::new_v4();
-            crate::server::insert_switch_sides_uuid(id, uuid.clone());
-            allow_err!(
-                stream
-                    .send(&Data::SwitchSidesRequest(uuid.to_string()))
-                    .await
-            );
-        }
-        #[cfg(feature = "flutter")]
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        Data::SwitchSidesUuid(uuid, id, None) => {
-            let allowed = uuid
-                .parse::<uuid::Uuid>()
-                .map(|uuid| crate::server::remove_pending_switch_sides_uuid(&id, &uuid))
-                .unwrap_or(false);
-            allow_err!(
-                stream
-                    .send(&Data::SwitchSidesUuid(uuid, id, Some(allowed)))
-                    .await
-            );
-        }
-        #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        Data::Plugin(plugin) => crate::plugin::ipc::handle_plugin(plugin, stream).await,
         #[cfg(windows)]
         Data::ControlledSessionCount(_) => {
             allow_err!(
@@ -1019,13 +878,6 @@ async fn handle(data: Data, stream: &mut Connection) {
                     )))
                     .await
             );
-        }
-        #[cfg(all(
-            feature = "flutter",
-            not(any(target_os = "android", target_os = "ios"))
-        ))]
-        Data::ControllingSessionCount(count) => {
-            crate::updater::update_controlling_session_count(count);
         }
         #[cfg(target_os = "linux")]
         Data::TerminalSessionCount(_) => {
@@ -1371,83 +1223,6 @@ pub async fn connect_for_uid(
     Ok(conn)
 }
 
-#[cfg(target_os = "linux")]
-#[tokio::main(flavor = "current_thread")]
-pub async fn start_pa() {
-    use crate::audio_service::AUDIO_DATA_SIZE_U8;
-
-    match new_listener("_pa").await {
-        Ok(mut incoming) => {
-            loop {
-                if let Some(result) = incoming.next().await {
-                    match result {
-                        Ok(stream) => {
-                            let mut stream = Connection::new(stream);
-                            let mut device: String = "".to_owned();
-                            if let Some(Ok(Some(Data::Config((_, Some(x)))))) =
-                                stream.next_timeout2(1000).await
-                            {
-                                device = x;
-                            }
-                            if !device.is_empty() {
-                                device = crate::platform::linux::get_pa_source_name(&device);
-                            }
-                            if device.is_empty() {
-                                device = crate::platform::linux::get_pa_monitor();
-                            }
-                            if device.is_empty() {
-                                continue;
-                            }
-                            let spec = pulse::sample::Spec {
-                                format: pulse::sample::Format::F32le,
-                                channels: 2,
-                                rate: crate::platform::PA_SAMPLE_RATE,
-                            };
-                            log::info!("pa monitor: {:?}", device);
-                            // systemctl --user status pulseaudio.service
-                            let mut buf: Vec<u8> = vec![0; AUDIO_DATA_SIZE_U8];
-                            match psimple::Simple::new(
-                                None,                             // Use the default server
-                                &crate::get_app_name(),           // Our application’s name
-                                pulse::stream::Direction::Record, // We want a record stream
-                                Some(&device),                    // Use the default device
-                                "record",                         // Description of our stream
-                                &spec,                            // Our sample format
-                                None,                             // Use default channel map
-                                None, // Use default buffering attributes
-                            ) {
-                                Ok(s) => loop {
-                                    if let Ok(_) = s.read(&mut buf) {
-                                        let out =
-                                            if buf.iter().filter(|x| **x != 0).next().is_none() {
-                                                vec![]
-                                            } else {
-                                                buf.clone()
-                                            };
-                                        if let Err(err) = stream.send_raw(out.into()).await {
-                                            log::error!("Failed to send audio data:{}", err);
-                                            break;
-                                        }
-                                    }
-                                },
-                                Err(err) => {
-                                    log::error!("Could not create simple pulse: {}", err);
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            log::error!("Couldn't get pa client: {:?}", err);
-                        }
-                    }
-                }
-            }
-        }
-        Err(err) => {
-            log::error!("Failed to start pa ipc server: {}", err);
-        }
-    }
-}
-
 pub struct ConnectionTmpl<T> {
     inner: Framed<T, BytesCodec>,
 }
@@ -1557,162 +1332,10 @@ pub async fn set_config(name: &str, value: String) -> ResultType<()> {
     set_config_async(name, value).await
 }
 
-pub fn update_temporary_password() -> ResultType<()> {
-    set_config("temporary-password", "".to_owned())
-}
-
-fn apply_permanent_password_storage_and_salt_payload(payload: Option<&str>) -> ResultType<()> {
-    let Some(payload) = payload else {
-        return Ok(());
-    };
-    let Some((storage, salt)) = payload.split_once('\n') else {
-        bail!("Invalid permanent-password-storage-and-salt payload");
-    };
-
-    Config::set_permanent_password_storage_for_sync(storage, salt)?;
-    Ok(())
-}
-
-pub fn sync_permanent_password_storage_from_daemon() -> ResultType<()> {
-    let v = get_config("permanent-password-storage-and-salt")?;
-    apply_permanent_password_storage_and_salt_payload(v.as_deref())
-}
-
-async fn sync_permanent_password_storage_from_daemon_async() -> ResultType<()> {
-    let ms_timeout = 1_000;
-    let v = get_config_async("permanent-password-storage-and-salt", ms_timeout).await?;
-    apply_permanent_password_storage_and_salt_payload(v.as_deref())
-}
-
-pub fn is_permanent_password_set() -> bool {
-    match get_config("permanent-password-set") {
-        Ok(Some(v)) => {
-            let v = v.trim();
-            return v == "Y";
-        }
-        Ok(None) => {
-            // No response/value (timeout).
-        }
-        Err(_) => {
-            // Connection error.
-        }
-    }
-    log::warn!("Failed to query permanent password state from daemon");
-    false
-}
-
-pub fn is_permanent_password_preset() -> bool {
-    if let Ok(Some(v)) = get_config("permanent-password-is-preset") {
-        let v = v.trim();
-        return v == "Y";
-    }
-    false
-}
-
 pub fn get_fingerprint() -> String {
     get_config("fingerprint")
         .unwrap_or_default()
         .unwrap_or_default()
-}
-
-pub fn set_permanent_password(v: String) -> ResultType<()> {
-    if Config::is_disable_change_permanent_password() {
-        bail!("Changing permanent password is disabled");
-    }
-    if set_permanent_password_with_ack(v)? {
-        Ok(())
-    } else {
-        bail!("Changing permanent password was rejected by daemon");
-    }
-}
-
-#[tokio::main(flavor = "current_thread")]
-pub async fn set_permanent_password_with_ack(v: String) -> ResultType<bool> {
-    set_permanent_password_with_ack_async(v).await
-}
-
-async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
-    // The daemon ACK/NACK is expected quickly since it applies the config in-process.
-    let ms_timeout = 1_000;
-    let mut c = connect(ms_timeout, "").await?;
-    c.send_config("permanent-password", v).await?;
-    if let Some(Data::Config((name2, Some(v)))) = c.next_timeout(ms_timeout).await? {
-        if name2 == "permanent-password" {
-            let v = v.trim();
-            let ok = v == "Y";
-            if ok {
-                // Ensure the hashed permanent password storage is written to the user config file.
-                // This sync must not affect the daemon ACK outcome.
-                if let Err(err) = sync_permanent_password_storage_from_daemon_async().await {
-                    log::warn!("Failed to sync permanent password storage from daemon: {err}");
-                }
-            }
-            return Ok(ok);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn set_unlock_pin(v: String, translate: bool) -> ResultType<()> {
-    let v = v.trim().to_owned();
-    let min_len = 4;
-    let max_len = crate::ui_interface::max_encrypt_len();
-    let len = v.chars().count();
-    if !v.is_empty() {
-        if len < min_len {
-            let err = if translate {
-                crate::lang::translate(
-                    "Requires at least {".to_string() + &format!("{min_len}") + "} characters",
-                )
-            } else {
-                // Sometimes, translated can't show normally in command line
-                format!("Requires at least {} characters", min_len)
-            };
-            bail!(err);
-        }
-        if len > max_len {
-            bail!("No more than {max_len} characters");
-        }
-    }
-    Config::set_unlock_pin(&v);
-    set_config("unlock-pin", v)
-}
-
-#[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn get_unlock_pin() -> String {
-    if let Ok(Some(v)) = get_config("unlock-pin") {
-        Config::set_unlock_pin(&v);
-        v
-    } else {
-        Config::get_unlock_pin()
-    }
-}
-
-#[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn get_trusted_devices() -> String {
-    if let Ok(Some(v)) = get_config("trusted-devices") {
-        v
-    } else {
-        Config::get_trusted_devices_json()
-    }
-}
-
-#[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn remove_trusted_devices(hwids: Vec<Bytes>) {
-    Config::remove_trusted_devices(&hwids);
-    allow_err!(set_data(&Data::RemoveTrustedDevices(hwids)));
-}
-
-#[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn clear_trusted_devices() {
-    Config::clear_trusted_devices();
-    allow_err!(set_data(&Data::ClearTrustedDevices));
 }
 
 pub fn get_id() -> String {
@@ -1790,7 +1413,6 @@ pub fn set_option(key: &str, value: &str) {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
-    let _nat = CheckTestNatType::new();
     if let Ok(mut c) = connect(1000, "").await {
         c.send(&Data::Options(Some(value.clone()))).await?;
         // do not put below before connect, because we need to check should_exit
@@ -1848,7 +1470,6 @@ pub async fn get_socks() -> Option<config::Socks5Server> {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn set_socks(value: config::Socks5Server) -> ResultType<()> {
-    let _nat = CheckTestNatType::new();
     Config::set_socks(if value.proxy.is_empty() {
         None
     } else {
@@ -2031,17 +1652,6 @@ pub async fn clear_wayland_screencast_restore_token(key: String) -> ResultType<b
         return Ok(v.is_empty());
     }
     return Ok(false);
-}
-
-#[cfg(all(
-    feature = "flutter",
-    not(any(target_os = "android", target_os = "ios"))
-))]
-#[tokio::main(flavor = "current_thread")]
-pub async fn update_controlling_session_count(count: usize) -> ResultType<()> {
-    let mut c = connect(1000, "").await?;
-    c.send(&Data::ControllingSessionCount(count)).await?;
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]

@@ -8,9 +8,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-#[cfg(all(target_os = "windows", not(feature = "flutter")))]
+#[cfg(target_os = "windows")]
 use hbb_common::config::keys;
-#[cfg(not(feature = "flutter"))]
 use hbb_common::fs;
 use hbb_common::{
     allow_err,
@@ -26,8 +25,6 @@ use hbb_common::{
     whoami, Stream,
 };
 use rdev::{Event, EventType::*, KeyCode};
-#[cfg(all(feature = "vram", feature = "flutter"))]
-use std::ffi::c_void;
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
@@ -38,7 +35,6 @@ use std::{
     },
     time::SystemTime,
 };
-use uuid::Uuid;
 
 use crate::client::io_loop::Remote;
 use crate::client::{
@@ -237,11 +233,6 @@ impl<T: InvokeUiSession> Session<T> {
         self.lc.read().unwrap().conn_type.eq(&ConnType::RDP)
     }
 
-    #[cfg(feature = "flutter")]
-    pub fn is_multi_ui_session(&self) -> bool {
-        self.ui_handler.is_multi_ui_session()
-    }
-
     pub fn get_view_style(&self) -> String {
         self.lc.read().unwrap().view_style.clone()
     }
@@ -383,7 +374,7 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn toggle_option(&self, name: String) {
         let msg = self.lc.write().unwrap().toggle_option(name.clone());
-        #[cfg(all(target_os = "windows", not(feature = "flutter")))]
+        #[cfg(target_os = "windows")]
         if name == keys::OPTION_ENABLE_FILE_COPY_PASTE {
             self.send(Data::ToggleClipboardFile);
         }
@@ -408,7 +399,6 @@ impl<T: InvokeUiSession> Session<T> {
         self.lc.read().unwrap().get_toggle_option(&name)
     }
 
-    #[cfg(not(feature = "flutter"))]
     pub fn is_privacy_mode_supported(&self) -> bool {
         self.lc.read().unwrap().is_privacy_mode_supported()
     }
@@ -430,17 +420,6 @@ impl<T: InvokeUiSession> Session<T> {
             && !lc.view_only.v
     }
 
-    #[cfg(feature = "flutter")]
-    pub fn refresh_video(&self, display: i32) {
-        if crate::common::is_support_multi_ui_session_num(self.lc.read().unwrap().version) {
-            self.send(Data::Message(LoginConfigHandler::refresh_display(
-                display as _,
-            )));
-        } else {
-            self.send(Data::Message(LoginConfigHandler::refresh()));
-        }
-    }
-
     pub fn toggle_virtual_display(&self, index: i32, on: bool) {
         let mut misc = Misc::new();
         misc.set_toggle_virtual_display(ToggleVirtualDisplay {
@@ -453,7 +432,6 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg_out));
     }
 
-    #[cfg(not(feature = "flutter"))]
     pub fn refresh_video(&self, _display: i32) {
         self.send(Data::Message(LoginConfigHandler::refresh()));
     }
@@ -511,7 +489,6 @@ impl<T: InvokeUiSession> Session<T> {
         self.lc.read().unwrap().remember
     }
 
-    #[cfg(not(feature = "flutter"))]
     pub fn set_write_override(
         &mut self,
         job_id: i32,
@@ -569,16 +546,6 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg));
     }
 
-    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    pub fn send_plugin_request(&self, request: PluginRequest) {
-        let mut misc = Misc::new();
-        misc.set_plugin_request(request);
-        let mut msg_out = Message::new();
-        msg_out.set_misc(misc);
-        self.send(Data::Message(msg_out));
-    }
-
     pub fn get_audit_server(&self, typ: String) -> String {
         if LocalConfig::get_option("access_token").is_empty() {
             return "".to_owned();
@@ -590,17 +557,10 @@ impl<T: InvokeUiSession> Session<T> {
         )
     }
 
-    pub fn send_note(&self, note: String) {
-        let url = self.get_audit_server("conn".to_string());
-        let id = self.get_id();
-        let session_id = self.lc.read().unwrap().session_id;
-        *self.last_audit_note.lock().unwrap() = note.clone();
-        std::thread::spawn(move || {
-            send_note(url, id, session_id, note);
-        });
+    pub fn send_note(&self, _note: String) {
+        log::warn!("send_note disabled: no outgoing network calls");
     }
 
-    #[cfg(not(feature = "flutter"))]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn is_xfce(&self) -> bool {
         crate::platform::is_xfce()
@@ -687,14 +647,6 @@ impl<T: InvokeUiSession> Session<T> {
 
     pub fn input_os_password(&self, pass: String, activate: bool) {
         input_os_password(pass, activate, self.clone());
-    }
-
-    #[cfg(not(feature = "flutter"))]
-    pub fn get_chatbox(&self) -> String {
-        #[cfg(feature = "inline")]
-        return crate::ui::inline::get_chatbox();
-        #[cfg(not(feature = "inline"))]
-        return "".to_owned();
     }
 
     pub fn swap_modifier_key(&self, msg: &mut KeyEvent) {
@@ -1316,7 +1268,6 @@ impl<T: InvokeUiSession> Session<T> {
         }));
     }
 
-    #[cfg(not(feature = "flutter"))]
     pub fn get_icon_path(&self, file_type: i32, ext: String) -> String {
         let mut path = Config::icon_path();
         if file_type == FileType::DirLink as i32 {
@@ -1442,7 +1393,7 @@ impl<T: InvokeUiSession> Session<T> {
             // no last jobs
             return;
         }
-        let reconnect_count_thr = if cfg!(feature = "flutter") { 0 } else { 1 };
+        let reconnect_count_thr = 1;
         let is_reconnected = self.reconnect_count.load(Ordering::SeqCst) > reconnect_count_thr;
         // TODO: can add a confirm dialog
         let mut cnt = 1;
@@ -1483,44 +1434,7 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::ElevateWithLogon(username, password));
     }
 
-    #[cfg(any(target_os = "android", target_os = "ios", not(feature = "flutter")))]
     pub fn switch_sides(&self) {}
-
-    #[cfg(feature = "flutter")]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    #[tokio::main(flavor = "current_thread")]
-    pub async fn switch_sides(&self) {
-        match crate::ipc::connect(1000, "").await {
-            Ok(mut conn) => {
-                if conn
-                    .send(&crate::ipc::Data::SwitchSidesRequest(self.get_id()))
-                    .await
-                    .is_ok()
-                {
-                    if let Ok(Some(data)) = conn.next_timeout(1000).await {
-                        match data {
-                            crate::ipc::Data::SwitchSidesRequest(str_uuid) => {
-                                if let Ok(uuid) = Uuid::from_str(&str_uuid) {
-                                    let mut misc = Misc::new();
-                                    misc.set_switch_sides_request(SwitchSidesRequest {
-                                        uuid: Bytes::from(uuid.as_bytes().to_vec()),
-                                        ..Default::default()
-                                    });
-                                    let mut msg_out = Message::new();
-                                    msg_out.set_misc(misc);
-                                    self.send(Data::Message(msg_out));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                log::info!("server not started (will try to start): {}", err);
-            }
-        }
-    }
 
     fn set_custom_resolution(&self, display: &SwitchDisplay) {
         if display.width == display.original_resolution.width
@@ -1593,18 +1507,6 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg));
     }
 
-    #[inline]
-    pub fn request_voice_call(&self) {
-        #[cfg(target_os = "linux")]
-        std::thread::spawn(crate::ipc::start_pa);
-        self.send(Data::NewVoiceCall);
-    }
-
-    #[inline]
-    pub fn close_voice_call(&self) {
-        self.send(Data::CloseVoiceCall);
-    }
-
     pub fn send_selected_session_id(&self, sid: String) {
         if let Ok(sid) = sid.parse::<u32>() {
             self.lc.write().unwrap().selected_windows_session_id = Some(sid);
@@ -1622,7 +1524,6 @@ impl<T: InvokeUiSession> Session<T> {
                                 "No active console user logged on, please connect and logon first.",
                             );
                         } else {
-                            #[cfg(not(feature = "flutter"))]
                             {
                                 let remote_dir = self.get_option("remote_dir".to_string());
                                 let show_hidden =
@@ -1729,18 +1630,10 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn cancel_msgbox(&self, tag: &str);
     fn switch_back(&self, id: &str);
     fn portable_service_running(&self, running: bool);
-    fn on_voice_call_started(&self);
-    fn on_voice_call_closed(&self, reason: &str);
-    fn on_voice_call_waiting(&self);
-    fn on_voice_call_incoming(&self);
     fn get_rgba(&self, display: usize) -> *const u8;
     fn next_rgba(&self, display: usize);
-    #[cfg(all(feature = "vram", feature = "flutter"))]
-    fn on_texture(&self, display: usize, texture: *mut c_void);
     fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>);
     fn set_current_display(&self, disp_idx: i32);
-    #[cfg(feature = "flutter")]
-    fn is_multi_ui_session(&self) -> bool;
     fn update_record_status(&self, start: bool);
     fn update_empty_dirs(&self, _res: ReadEmptyDirsResponse) {}
     fn printer_request(&self, id: i32, path: String);
@@ -2072,8 +1965,4 @@ async fn start_one_port_forward<T: InvokeUiSession>(
     log::info!("port forward (:{}) exit", port);
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn send_note(url: String, id: String, sid: u64, note: String) {
-    let body = serde_json::json!({ "id": id, "session_id": sid, "note": note });
-    allow_err!(crate::post_request(url, body.to_string(), "").await);
-}
+

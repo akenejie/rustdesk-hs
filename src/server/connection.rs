@@ -8,8 +8,7 @@ use super::{input_service::*, *};
 use crate::clipboard::try_empty_clipboard_files;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::clipboard::{update_clipboard, ClipboardSide};
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-use crate::clipboard_file::*;
+
 #[cfg(target_os = "android")]
 use crate::keyboard::client::map_key_to_control_key;
 #[cfg(target_os = "linux")]
@@ -18,28 +17,21 @@ use crate::platform::linux_desktop_manager;
 use crate::platform::WallPaperRemover;
 #[cfg(windows)]
 use crate::portable_service::client as portable_client;
-use crate::{
-    client::{
-        new_voice_call_request, new_voice_call_response, start_audio_thread, MediaData, MediaSender,
-    },
-    display_service, ipc, privacy_mode, video_service, VERSION,
-};
-#[cfg(any(target_os = "android", target_os = "ios"))]
-use crate::{common::DEVICE_NAME, flutter::connection_manager::start_channel};
+use crate::{display_service, ipc, privacy_mode, video_service, VERSION};
+#[cfg(target_os = "android")]
+use crate::common::DEVICE_NAME;
 use cidr_utils::cidr::IpCidr;
 #[cfg(target_os = "android")]
 use hbb_common::protobuf::EnumOrUnknown;
 use hbb_common::{
     config::{
-        self, decode_permanent_password_h1_from_storage, decode_preset_password_h1_from_storage,
-        keys, local_permanent_password_storage_is_usable_for_auth,
-        preset_permanent_password_storage_is_usable_for_auth, Config, TrustedDevice,
+        self, decode_permanent_password_h1_from_storage, keys,
+        local_permanent_password_storage_is_usable_for_auth, Config, TrustedDevice,
     },
     fs::{self, can_enable_overwrite_detection, JobType},
     futures::{SinkExt, StreamExt},
     get_time, get_version_number,
     message_proto::{option_message::BoolOption, permission_info::Permission},
-    password_security::{self as password, ApproveMode},
     sha2::{Digest, Sha256},
     sleep, timeout,
     tokio::{
@@ -59,7 +51,6 @@ use std::sync::atomic::Ordering;
 use std::{
     collections::HashSet,
     net::Ipv6Addr,
-    num::NonZeroI64,
     path::PathBuf,
     str::FromStr,
     sync::{atomic::AtomicI64, mpsc as std_mpsc},
@@ -73,29 +64,14 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use crate::virtual_display_manager;
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
 
-const FAILURE_IDX_ID_WHITELIST: usize = 2;
-// How long a rejection counts, so also how long a blocked address stays blocked. Longer
-// throttles enumeration harder; shorter limits collateral on whitelisted neighbours.
-const ID_WHITELIST_FAILURE_DECAY_MINUTES: i32 = 10;
-
 lazy_static::lazy_static! {
-    // [0] password, [1] 2FA, [2] ID whitelist.
-    // Bucket 2 is separate so its rejections do not touch the password / 2FA budgets. It is
-    // decayed in `check_id_whitelist` and cleared on auth, never on a bare id match.
-    static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 3] = Default::default();
+    static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = Default::default();
     static ref SESSIONS: Arc::<Mutex<HashMap<SessionKey, Session>>> = Default::default();
     static ref ALIVE_CONNS: Arc::<Mutex<Vec<i32>>> = Default::default();
     pub static ref AUTHED_CONNS: Arc::<Mutex<Vec<AuthedConn>>> = Default::default();
     pub static ref CONTROL_PERMISSIONS_ARRAY: Arc::<Mutex<Vec<(i32, ControlPermissions)>>> = Default::default();
     static ref WAKELOCK_SENDER: Arc::<Mutex<std::sync::mpsc::Sender<(usize, usize)>>> = Arc::new(Mutex::new(start_wakelock_thread()));
     static ref WAKELOCK_KEEP_AWAKE_OPTION: Arc::<Mutex<Option<bool>>> = Default::default();
-}
-
-#[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-lazy_static::lazy_static! {
-    static ref SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
-    static ref PENDING_SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
 }
 
 #[cfg(target_os = "windows")]
@@ -147,43 +123,6 @@ pub static CLICK_TIME: AtomicI64 = AtomicI64::new(0);
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub static MOUSE_MOVE_TIME: AtomicI64 = AtomicI64::new(0);
 
-#[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-lazy_static::lazy_static! {
-    static ref PLUGIN_BLOCK_INPUT_TXS: Arc<Mutex<HashMap<String, std_mpsc::Sender<MessageInput>>>> = Default::default();
-    static ref PLUGIN_BLOCK_INPUT_TX_RX: (Arc<Mutex<std_mpsc::Sender<bool>>>, Arc<Mutex<std_mpsc::Receiver<bool>>>) = {
-        let (tx, rx) = std_mpsc::channel();
-        (Arc::new(Mutex::new(tx)), Arc::new(Mutex::new(rx)))
-    };
-}
-
-// Block input is required for some special cases, such as privacy mode.
-#[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn plugin_block_input(peer: &str, block: bool) -> bool {
-    if let Some(tx) = PLUGIN_BLOCK_INPUT_TXS.lock().unwrap().get(peer) {
-        let _ = tx.send(if block {
-            MessageInput::BlockOnPlugin(peer.to_string())
-        } else {
-            MessageInput::BlockOffPlugin(peer.to_string())
-        });
-        match PLUGIN_BLOCK_INPUT_TX_RX
-            .1
-            .lock()
-            .unwrap()
-            .recv_timeout(std::time::Duration::from_millis(3_000))
-        {
-            Ok(b) => b == block,
-            Err(..) => {
-                log::error!("plugin_block_input timeout");
-                false
-            }
-        }
-    } else {
-        false
-    }
-}
-
 #[derive(Clone, Default)]
 pub struct ConnInner {
     id: i32,
@@ -209,12 +148,6 @@ enum MessageInput {
     Pointer((PointerDeviceEvent, i32)),
     BlockOn,
     BlockOff,
-    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    BlockOnPlugin(String),
-    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    BlockOffPlugin(String),
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -325,7 +258,6 @@ pub struct Connection {
     tx_to_cm: mpsc::UnboundedSender<ipc::Data>,
     authorized: bool,
     require_2fa: Option<totp_rs::TOTP>,
-    awaiting_2fa: bool,
     keyboard: bool,
     clipboard: bool,
     audio: bool,
@@ -354,8 +286,6 @@ pub struct Connection {
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     enable_file_transfer: bool,
     // by peer
-    audio_sender: Option<MediaSender>,
-    // audio by the remote peer/client
     tx_input: std_mpsc::Sender<MessageInput>,
     // handle input messages
     video_ack_required: bool,
@@ -370,8 +300,6 @@ pub struct Connection {
     #[cfg(windows)]
     portable: PortableState,
     from_switch: bool,
-    voice_call_request_timestamp: Option<NonZeroI64>,
-    voice_calling: bool,
     options_in_login: Option<OptionMessage>,
     #[cfg(not(any(target_os = "ios")))]
     pressed_modifiers: HashSet<rdev::Key>,
@@ -393,9 +321,6 @@ pub struct Connection {
     multi_ui_session: bool,
     tx_from_authed: mpsc::UnboundedSender<ipc::Data>,
     printer_data: Vec<(Instant, String, Vec<u8>)>,
-    // For post requests that need to be sent sequentially.
-    // eg. post_conn_audit
-    tx_post_seq: mpsc::UnboundedSender<(String, Value)>,
     conn_audit_primary_auth: ConnAuditPrimaryAuth,
     conn_audit_two_factor: ConnAuditTwoFactor,
     // Tracks read job IDs delegated to CM process.
@@ -489,7 +414,10 @@ impl Connection {
         let (tx_video, mut rx_video) = mpsc::unbounded_channel::<(Instant, Arc<Message>)>();
         let (tx_input, _rx_input) = std_mpsc::channel();
         let (tx_from_authed, mut rx_from_authed) = mpsc::unbounded_channel::<ipc::Data>();
-        let mut hbbs_rx = crate::hbbs_http::sync::signal_receiver();
+            let mut hbbs_rx = {
+                let (_, rx) = tokio::sync::broadcast::channel::<Vec<i32>>(1);
+                rx
+            };
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let (tx_cm_stream_ready, _rx_cm_stream_ready) = mpsc::channel(1);
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -497,11 +425,6 @@ impl Connection {
         #[cfg(target_os = "linux")]
         let linux_headless_handle =
             LinuxHeadlessHandle::new(_rx_cm_stream_ready, _tx_desktop_ready);
-
-        let (tx_post_seq, rx_post_seq) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            Self::post_seq_loop(rx_post_seq).await;
-        });
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let tx_cloned = tx.clone();
@@ -512,7 +435,6 @@ impl Connection {
                 tx_video: Some(tx_video),
             },
             require_2fa: crate::auth_2fa::get_2fa(None),
-            awaiting_2fa: false,
             // Defer display enumeration until login succeeds. Monitor login replaces this
             // with the primary index returned with the refreshed display snapshot.
             display_idx: 0,
@@ -567,9 +489,6 @@ impl Connection {
             #[cfg(windows)]
             portable: Default::default(),
             from_switch: false,
-            audio_sender: None,
-            voice_call_request_timestamp: None,
-            voice_calling: false,
             options_in_login: None,
             #[cfg(not(any(target_os = "ios")))]
             pressed_modifiers: Default::default(),
@@ -593,7 +512,6 @@ impl Connection {
             retina: Retina::default(),
             tx_from_authed,
             printer_data: Vec::new(),
-            tx_post_seq,
             cm_read_job_ids: HashSet::new(),
             terminal_service_id: "".to_owned(),
             terminal_persistent: false,
@@ -611,8 +529,6 @@ impl Connection {
             sleep(1.).await;
             return;
         }
-        #[cfg(target_os = "android")]
-        start_channel(rx_to_cm, tx_from_cm);
         #[cfg(target_os = "android")]
         conn.send_permission(Permission::Keyboard, conn.keyboard)
             .await;
@@ -750,21 +666,6 @@ impl Connection {
                             } else if &name == "audio" {
                                 conn.audio = enabled;
                                 conn.send_permission(Permission::Audio, enabled).await;
-                                if conn.authorized {
-                                    if let Some(s) = conn.server.upgrade() {
-                                        if conn.is_authed_view_camera_conn() {
-                                            if conn.voice_calling || !conn.audio_enabled() {
-                                                s.write().unwrap().subscribe(
-                                                    super::audio_service::NAME,
-                                                    conn.inner.clone(), conn.audio_enabled());
-                                            }
-                                        } else {
-                                            s.write().unwrap().subscribe(
-                                                super::audio_service::NAME,
-                                                conn.inner.clone(), conn.audio_enabled());
-                                        }
-                                    }
-                                }
                             } else if &name == "file" {
                                 conn.file = enabled;
                                 conn.send_permission(Permission::File, enabled).await;
@@ -884,25 +785,6 @@ impl Connection {
                             if let Err(e) = portable_client::start_portable_service(portable_client::StartPara::Direct) {
                                 log::error!("Failed to start portable service from cm: {:?}", e);
                             }
-                        }
-                        #[cfg(feature = "flutter")]
-                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                        ipc::Data::SwitchSidesBack => {
-                            let mut misc = Misc::new();
-                            misc.set_switch_back(SwitchBack::default());
-                            let mut msg = Message::new();
-                            msg.set_misc(misc);
-                            conn.send(msg).await;
-                        }
-                        ipc::Data::VoiceCallResponse(accepted) => {
-                            conn.handle_voice_call(accepted).await;
-                        }
-                        ipc::Data::CloseVoiceCall(_reason) => {
-                            log::debug!("Close the voice call from the ipc.");
-                            conn.close_voice_call().await;
-                            // Notify the peer that we closed the voice call.
-                            let msg = new_voice_call_request(false);
-                            conn.send(msg).await;
                         }
                         ipc::Data::ReadJobInitResult { id, file_num, include_hidden, conn_id, result } => {
                             if conn_id == conn.inner.id() {
@@ -1065,14 +947,6 @@ impl Connection {
                 },
                 Some(data) = rx_from_authed.recv() => {
                     match data {
-                        #[cfg(all(target_os = "windows", feature = "flutter"))]
-                        ipc::Data::PrinterData(data) => {
-                            if Self::permission(keys::OPTION_ENABLE_REMOTE_PRINTER, &conn.control_permissions) {
-                                conn.send_printer_request(data).await;
-                            } else {
-                                conn.send_remote_printing_disallowed().await;
-                            }
-                        }
                         _ => {}
                     }
                 }
@@ -1138,16 +1012,7 @@ impl Connection {
                 let _ = Self::turn_off_privacy_to_msg(id, String::new());
             }
         }
-        #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        crate::plugin::handle_listen_event(
-            crate::plugin::EVENT_ON_CONN_CLOSE_SERVER.to_owned(),
-            conn.lr.my_id.clone(),
-        );
         video_service::notify_video_frame_fetched_by_conn_id(id, None);
-        if conn.authorized {
-            password::update_temporary_password();
-        }
         if let Err(err) = conn.try_port_forward_loop(&mut rx_from_cm).await {
             conn.on_close(&err.to_string(), false).await;
             raii::AuthedConnID::check_remove_session(conn.inner.id(), conn.session_key());
@@ -1228,32 +1093,6 @@ impl Connection {
                             );
                         }
                     }
-                    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    MessageInput::BlockOnPlugin(_peer) => {
-                        let (ok, _msg) = crate::platform::block_input(true);
-                        if ok {
-                            block_input_mode = true;
-                        }
-                        let _r = PLUGIN_BLOCK_INPUT_TX_RX
-                            .0
-                            .lock()
-                            .unwrap()
-                            .send(block_input_mode);
-                    }
-                    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    MessageInput::BlockOffPlugin(_peer) => {
-                        let (ok, _msg) = crate::platform::block_input(false);
-                        if ok {
-                            block_input_mode = false;
-                        }
-                        let _r = PLUGIN_BLOCK_INPUT_TX_RX
-                            .0
-                            .lock()
-                            .unwrap()
-                            .send(block_input_mode);
-                    }
                 },
                 Err(err) => {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1271,13 +1110,6 @@ impl Connection {
         log::debug!("Input thread exited");
     }
 
-    async fn post_seq_loop(mut rx: mpsc::UnboundedReceiver<(String, Value)>) {
-        while let Some((url, v)) = rx.recv().await {
-            allow_err!(Self::post_audit_async(url, v).await);
-        }
-        log::debug!("post_seq_loop exited");
-    }
-
     async fn try_port_forward_loop(
         &mut self,
         rx_from_cm: &mut mpsc::UnboundedReceiver<Data>,
@@ -1286,7 +1118,10 @@ impl Connection {
         if let Some(mut forward) = self.port_forward_socket.take() {
             log::info!("Running port forwarding loop");
             self.stream.set_raw();
-            let mut hbbs_rx = crate::hbbs_http::sync::signal_receiver();
+        let mut hbbs_rx = {
+            let (_, rx) = tokio::sync::broadcast::channel::<Vec<i32>>(1);
+            rx
+        };
             loop {
                 tokio::select! {
                     Some(data) = rx_from_cm.recv() => {
@@ -1385,64 +1220,6 @@ impl Connection {
         true
     }
 
-    async fn check_id_whitelist(&mut self) -> bool {
-        let id_whitelist: Vec<String> = Config::get_option(keys::OPTION_ID_WHITELIST)
-            .split(',')
-            .map(|x| x.trim().to_owned())
-            .filter(|x| !x.is_empty())
-            .collect();
-        if id_whitelist.is_empty() {
-            return true;
-        }
-        // Limit before matching, or a match returning early would never touch the counter and
-        // leave enumeration unthrottled. Not cleared here: `my_id` is self-reported, so that
-        // would let anyone holding one allowed id reset the budget between probes.
-        self.decay_id_whitelist_failures();
-        let (failure, res) = self.check_failure(FAILURE_IDX_ID_WHITELIST).await;
-        if !res {
-            return false;
-        }
-        if id_whitelist_allows(&id_whitelist, &self.lr.my_id) {
-            return true;
-        }
-        self.update_failure(failure, false, FAILURE_IDX_ID_WHITELIST);
-        self.send_login_error("Your ID is blocked by the peer")
-            .await;
-        self.post_alarm_audit(
-            AlarmAuditType::IdWhitelist,
-            json!({ "id": self.lr.my_id.clone(), "ip": self.ip.clone(), "name": self.lr.my_name.clone() }),
-        );
-        false
-    }
-
-    // What `check_failure` consults: the source address, plus shared IPv6 prefixes.
-    fn failure_keys(&self) -> Vec<String> {
-        let mut keys = vec![self.ip.clone()];
-        if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
-            keys.extend([p64, p56, p48]);
-        }
-        keys
-    }
-
-    // Only this connection's own keys, so it stays O(1) instead of scanning the map.
-    fn decay_id_whitelist_failures(&self) {
-        decay_stale_failures(
-            &mut LOGIN_FAILURES[FAILURE_IDX_ID_WHITELIST].lock().unwrap(),
-            &self.failure_keys(),
-            (get_time() / 60_000) as i32,
-            ID_WHITELIST_FAILURE_DECAY_MINUTES,
-        );
-    }
-
-    // Not `update_failure(.., true, ..)`: it no-ops when the peer's own address has no entry,
-    // normal on IPv6, leaving the shared prefixes that are what actually block it.
-    fn clear_id_whitelist_failures(&self) {
-        clear_failures(
-            &mut LOGIN_FAILURES[FAILURE_IDX_ID_WHITELIST].lock().unwrap(),
-            &self.failure_keys(),
-        );
-    }
-
     async fn on_open(&mut self, addr: SocketAddr) -> bool {
         log::debug!("#{} Connection opened from {}.", self.inner.id, addr);
         if !self.check_whitelist(&addr).await {
@@ -1496,17 +1273,7 @@ impl Connection {
         }
     }
 
-    fn post_conn_audit(&self, v: Value) {
-        if self.server_audit_conn.is_empty() {
-            return;
-        }
-        let url = self.server_audit_conn.clone();
-        let mut v = v;
-        v["id"] = json!(Config::get_id());
-        v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
-        v["conn_id"] = json!(self.inner.id);
-        v["session_id"] = json!(self.lr.session_id);
-        allow_err!(self.tx_post_seq.send((url, v)));
+    fn post_conn_audit(&self, _v: Value) {
     }
 
     fn get_files_for_audit(job_type: fs::JobType, mut files: Vec<FileEntry>) -> Vec<(String, i64)> {
@@ -1527,85 +1294,17 @@ impl Connection {
 
     fn post_file_audit(
         &self,
-        r#type: FileAuditType,
-        path: &str,
-        files: Vec<(String, i64)>,
-        info: Value,
+        _type: FileAuditType,
+        _path: &str,
+        _files: Vec<(String, i64)>,
+        _info: Value,
     ) {
-        if self.server_audit_file.is_empty() {
-            return;
-        }
-        let url = self.server_audit_file.clone();
-        let file_num = files.len();
-        let mut files = files;
-        files.sort_by(|a, b| b.1.cmp(&a.1));
-        files.truncate(10);
-        let is_file = files.len() == 1 && files[0].0.is_empty();
-        let mut info = info;
-        info["ip"] = json!(self.ip.clone());
-        info["name"] = json!(self.lr.my_name.clone());
-        info["num"] = json!(file_num);
-        info["files"] = json!(files);
-        let v = json!({
-            "id":json!(Config::get_id()),
-            "uuid":json!(crate::encode64(hbb_common::get_uuid())),
-            "peer_id":json!(self.lr.my_id),
-            "conn_id":json!(self.inner.id()),
-            "type": r#type as i8,
-            "path":path,
-            "is_file":is_file,
-            "info":json!(info).to_string(),
-        });
-        tokio::spawn(async move {
-            allow_err!(Self::post_audit_async(url, v).await);
-        });
     }
 
-    fn post_alarm_audit(&self, typ: AlarmAuditType, info: Value) {
-        let url = crate::get_audit_server(
-            Config::get_option("api-server"),
-            Config::get_option("custom-rendezvous-server"),
-            "alarm".to_owned(),
-        );
-        if url.is_empty() {
-            return;
-        }
-        let mut v = Value::default();
-        v["id"] = json!(Config::get_id());
-        v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
-        v["typ"] = json!(typ as i8);
-        v["info"] = serde_json::Value::String(info.to_string());
-        v["conn_id"] = json!(self.inner.id());
-        if typ == AlarmAuditType::IpWhitelist || typ == AlarmAuditType::IdWhitelist {
-            if let Some(audit_ref) = self.conn_audit_ref() {
-                v["conn_audit_ref"] = json!(audit_ref);
-            }
-        }
-        tokio::spawn(async move {
-            allow_err!(Self::post_audit_async(url, v).await);
-        });
+    fn post_alarm_audit(&self, _typ: AlarmAuditType, _info: Value) {
     }
 
-    fn post_session_scope_violation_alarm(&self, message: &'static str) {
-        let conn_type = self
-            .authed_conn_type()
-            .map(AuthConnType::as_str)
-            .unwrap_or("unknown");
-        self.post_alarm_audit(
-            AlarmAuditType::SessionScopeViolation,
-            json!({
-                "id": self.lr.my_id.clone(),
-                "name": self.lr.my_name.clone(),
-                "ip": &self.ip,
-                "conn_type": conn_type,
-                "message": message,
-            }),
-        );
-    }
-
-    #[inline]
-    async fn post_audit_async(url: String, v: Value) -> ResultType<String> {
-        crate::post_request(url, v.to_string(), "").await
+    fn post_session_scope_violation_alarm(&self, _message: &'static str) {
     }
 
     fn set_conn_audit_primary_auth(&mut self, method: ConnAuditPrimaryAuth) {
@@ -1688,38 +1387,18 @@ impl Connection {
         }
         if self.require_2fa.is_some() && !self.is_recent_session(true) && !self.from_switch {
             self.require_2fa.as_ref().map(|totp| {
-                let bot = crate::auth_2fa::TelegramBot::get();
-                let bot = match bot {
-                    Ok(Some(bot)) => bot,
-                    Err(err) => {
-                        log::error!("Failed to get telegram bot: {}", err);
-                        return;
-                    }
-                    _ => return,
-                };
                 let code = totp.generate_current();
                 if let Ok(code) = code {
-                    let text = format!(
-                        "2FA code: {}\n\nA new connection has been established to your device with ID {}. The source IP address is {}.",
-                        code,
-                        Config::get_id(),
-                        self.ip,
+                    log::info!(
+                        "2FA code: {}, connection from IP: {}",
+                        code, self.ip
                     );
-                    tokio::spawn(async move {
-                        if let Err(err) =
-                            crate::auth_2fa::send_2fa_code_to_telegram(&text, bot).await
-                        {
-                            log::error!("Failed to send 2fa code to telegram bot: {}", err);
-                        }
-                    });
                 }
             });
-            self.awaiting_2fa = true;
             self.send_login_error(crate::client::REQUIRE_2FA).await;
             // Keep the connection alive so the client can continue with 2FA.
             return true;
         }
-        self.awaiting_2fa = false;
         if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await {
             return keep_alive;
         }
@@ -1727,9 +1406,6 @@ impl Connection {
             return false;
         }
         self.authorized = true;
-        // Releases the budget `check_id_whitelist` charges against this address: only a peer
-        // that got this far proved more than a self-reported id.
-        self.clear_id_whitelist_failures();
         let (conn_type, auth_conn_type) = if self.file_transfer.is_some() {
             (1, AuthConnType::FileTransfer)
         } else if self.port_forward_socket.is_some() {
@@ -1895,12 +1571,6 @@ impl Connection {
                 username = "".to_owned();
             }
         }
-        #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        PLUGIN_BLOCK_INPUT_TXS
-            .lock()
-            .unwrap()
-            .insert(self.lr.my_id.clone(), self.tx_input.clone());
 
         // Terminal feature is supported on desktop only
         #[allow(unused_mut)]
@@ -2077,7 +1747,7 @@ impl Connection {
                     noperms.push(super::clipboard_service::FILE_NAME);
                 }
                 if !self.audio_enabled() {
-                    noperms.push(super::audio_service::NAME);
+                    noperms.push("audio");
                 }
                 let mut s = s.write().unwrap();
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -2308,109 +1978,17 @@ impl Connection {
         self.validate_password_plain(storage)
     }
 
-    fn validate_preset_password_storage(&self, storage: &str, salt: &str) -> bool {
-        if salt.is_empty() {
-            return self.validate_password_plain(storage);
-        }
-        let Some(h1) = decode_preset_password_h1_from_storage(storage) else {
-            return false;
-        };
-        self.verify_h1(&h1[..])
-    }
-
-    // This is coarse brute-force protection for the current temporary password value.
-    // We only care whether the active temporary password itself was presented correctly,
-    // not whether later authorization steps succeed. A successful temporary-password
-    // match clears this state immediately, and the counter also resets whenever the
-    // temporary password changes or is rotated.
-    fn check_update_temporary_password(&self, temporary_password_success: bool) {
-        const MAX_CONSECUTIVE_FAILURES: i32 = 10;
-        #[derive(Default)]
-        struct State {
-            password: String,
-            failures: i32,
-        }
-        lazy_static::lazy_static! {
-            static ref TEMPORARY_PASSWORD_FAILURES: Mutex<State> =
-                Mutex::new(State::default());
-        }
-
-        if !password::temporary_enabled() {
-            return;
-        }
-
-        let mut state = TEMPORARY_PASSWORD_FAILURES.lock().unwrap();
-        let current_password = password::temporary_password();
-        if current_password.is_empty() {
-            return;
-        }
-        if state.password != current_password {
-            state.password = current_password;
-            state.failures = 0;
-        }
-
-        if temporary_password_success {
-            state.failures = 0;
-            return;
-        }
-        state.failures += 1;
-
-        if state.failures < MAX_CONSECUTIVE_FAILURES {
-            return;
-        }
-
-        password::update_temporary_password();
-        let new_password = password::temporary_password();
-        log::warn!(
-            "Temporary password rotated after too many consecutive wrong attempts: failures={}, ip={}",
-            state.failures,
-            self.ip,
-        );
-        state.password = new_password;
-        state.failures = 0;
-    }
-
-    fn validate_password(&mut self, allow_permanent_password: bool) -> bool {
-        if password::temporary_enabled() {
-            let password = password::temporary_password();
-            if self.validate_password_plain(&password) {
-                self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::TemporaryPassword);
-                raii::AuthedConnID::update_or_insert_session(
-                    self.session_key(),
-                    Some(password),
-                    Some(false),
-                );
-                self.check_update_temporary_password(true);
+    fn validate_password(&mut self) -> bool {
+        // Strictly check storage usability before auth so malformed encrypted/hash storage
+        // cannot fall back to being accepted as legacy plaintext.
+        let (local_storage, local_salt) =
+            Config::get_local_permanent_password_storage_and_salt();
+        if !local_storage.is_empty() {
+            if local_permanent_password_storage_is_usable_for_auth(&local_storage, &local_salt)
+                && self.validate_password_storage(&local_storage)
+            {
+                self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::PermanentPassword);
                 return true;
-            }
-        }
-        if password::permanent_enabled() || allow_permanent_password {
-            let print_fallback = || {
-                if allow_permanent_password && !password::permanent_enabled() {
-                    log::info!("Permanent password accepted via logon-screen fallback");
-                }
-            };
-            // Strictly check storage usability before auth so malformed encrypted/hash storage
-            // cannot fall back to being accepted as legacy plaintext.
-            let (local_storage, local_salt) =
-                Config::get_local_permanent_password_storage_and_salt();
-            if !local_storage.is_empty() {
-                if local_permanent_password_storage_is_usable_for_auth(&local_storage, &local_salt)
-                    && self.validate_password_storage(&local_storage)
-                {
-                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::PermanentPassword);
-                    print_fallback();
-                    return true;
-                }
-            } else {
-                let (hard, salt) = Config::get_preset_password_storage_and_salt();
-                if preset_permanent_password_storage_is_usable_for_auth(&hard, &salt)
-                    && self.validate_preset_password_storage(&hard, &salt)
-                {
-                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::PermanentPassword);
-                    print_fallback();
-                    return true;
-                }
             }
         }
         false
@@ -2446,16 +2024,6 @@ impl Connection {
 
     #[inline]
     pub fn is_permission_enabled_locally(enable_prefix_option: &str) -> bool {
-        #[cfg(feature = "flutter")]
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        {
-            let access_mode = Config::get_option("access-mode");
-            if access_mode == "full" {
-                return true;
-            } else if access_mode == "view" {
-                return false;
-            }
-        }
         config::option2bool(
             enable_prefix_option,
             &Config::get_option(enable_prefix_option),
@@ -2571,12 +2139,6 @@ impl Connection {
                     }
                 }
             });
-            #[cfg(all(windows, feature = "flutter"))]
-            std::thread::spawn(move || {
-                if crate::is_server() && !crate::check_process("--tray", false) {
-                    crate::platform::run_as_user(vec!["--tray"]).ok();
-                }
-            });
         }
     }
 
@@ -2600,15 +2162,11 @@ impl Connection {
         }
         // After handling CloseReason messages, proceed to process other message types
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
-            self.awaiting_2fa = false;
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
                 return true;
             }
             self.reset_session_scope_for_login();
-            if !self.check_id_whitelist().await {
-                return false;
-            }
             match lr.union {
                 Some(login_request::Union::FileTransfer(ft)) => {
                     if !Self::permission(
@@ -2730,49 +2288,24 @@ impl Connection {
                 return true;
             }
 
-            // https://github.com/rustdesk/rustdesk-server-pro/discussions/646
-            // `is_logon` is used to check login with `OPTION_ALLOW_LOGON_SCREEN_PASSWORD` == "Y".
-            // `is_logon_ui()` is a fallback for logon UI detection on Windows.
-            #[cfg(target_os = "windows")]
-            let is_logon = || {
-                crate::platform::is_prelogin() || crate::platform::is_locked() || {
-                    match crate::platform::is_logon_ui() {
-                        Ok(result) => result,
-                        Err(e) => {
-                            log::error!("Failed to detect logon UI: {:?}", e);
-                            false
-                        }
+            // Headless host: without a configured permanent password there is nothing
+            // to prompt for, so authorize the connection directly instead of asking
+            // for a password nobody set.
+            if !Config::has_permanent_password() {
+                if err_msg.is_empty() {
+                    #[cfg(target_os = "linux")]
+                    self.linux_headless_handle.wait_desktop_cm_ready().await;
+                    if !self.send_logon_response_and_keep_alive().await {
+                        return false;
                     }
-                }
-            };
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            let is_logon = || crate::platform::is_prelogin() || crate::platform::is_locked();
-            #[cfg(any(target_os = "android", target_os = "ios"))]
-            let is_logon = || crate::platform::is_prelogin();
-
-            let allow_logon_screen_password =
-                crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
-                    && is_logon();
-
-            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
-                || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
-            {
-                #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
-                    if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await
-                    {
-                        return keep_alive;
-                    }
-                }
-                self.try_start_cm(lr.my_id, lr.my_name, false);
-                if hbb_common::get_version_number(&lr.version)
-                    >= hbb_common::get_version_number("1.2.0")
-                {
-                    self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)
-                        .await;
+                    self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), true);
+                } else {
+                    self.send_login_error(err_msg).await;
                 }
                 return true;
-            } else if self.is_recent_session(false) {
+            }
+
+            if self.is_recent_session(false) {
                 if err_msg.is_empty() {
                     #[cfg(target_os = "linux")]
                     self.linux_headless_handle.wait_desktop_cm_ready().await;
@@ -2805,9 +2338,8 @@ impl Connection {
                 if !res {
                     return true;
                 }
-                if !self.validate_password(allow_logon_screen_password) {
+                if !self.validate_password() {
                     self.update_failure_with_scope(failure, false, 0, FailureScope::Default);
-                    self.check_update_temporary_password(false);
                     if err_msg.is_empty() {
                         self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)
                             .await;
@@ -2833,11 +2365,6 @@ impl Connection {
                 }
             }
         } else if let Some(message::Union::Auth2fa(tfa)) = msg.union {
-            // A 2FA response may arrive after click authorization has completed.
-            // Ignore it unless this connection is still waiting for the response.
-            if !self.awaiting_2fa {
-                return true;
-            }
             let (failure, res) = self.check_failure(1).await;
             if !res {
                 return true;
@@ -2887,48 +2414,6 @@ impl Connection {
                         .unwrap()
                         .user_network_delay(self.inner.id(), new_delay);
                     self.network_delay = new_delay;
-                }
-            }
-        } else if let Some(message::Union::SwitchSidesResponse(_s)) = msg.union {
-            #[cfg(feature = "flutter")]
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            if let Some(lr) = _s.lr.clone().take() {
-                SWITCH_SIDES_UUID
-                    .lock()
-                    .unwrap()
-                    .retain(|_, v| v.0.elapsed() < Duration::from_secs(10));
-                let uuid_old = SWITCH_SIDES_UUID.lock().unwrap().remove(&lr.my_id);
-                if let Ok(uuid) = uuid::Uuid::from_slice(_s.uuid.to_vec().as_ref()) {
-                    if let Some((_instant, uuid_old)) = uuid_old {
-                        if uuid == uuid_old {
-                            if lr.union.is_some() {
-                                log::warn!(
-                                    "Rejected switch sides response for non-remote-desktop session; closing connection"
-                                );
-                                self.send_login_error("Connection not allowed").await;
-                                return false;
-                            }
-                            self.reset_session_scope_for_login();
-                            self.handle_login_request_without_validation(&lr).await;
-                            // Switching sides authorizes without a password, so it must not bypass
-                            // the whitelist, which can be a locked policy pushed by the server.
-                            if !self.check_id_whitelist().await {
-                                return false;
-                            }
-                            self.from_switch = true;
-                            self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::SwitchSides);
-                            if !self.send_logon_response_and_keep_alive().await {
-                                return false;
-                            }
-                            self.try_start_cm(
-                                lr.my_id.clone(),
-                                lr.my_name.clone(),
-                                self.authorized,
-                            );
-                            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                            self.try_start_cm_ipc();
-                        }
-                    }
                 }
             }
         } else if self.authorized {
@@ -3137,26 +2622,6 @@ impl Connection {
                     if self.should_handle_text_clipboard_message() && self.clipboard_enabled() {
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(vec![cb], ClipboardSide::Host);
-                        // ios as the controlled side is actually not supported for now.
-                        // The following code is only used to preserve the logic of handling text clipboard on mobile.
-                        #[cfg(target_os = "ios")]
-                        {
-                            let content = if cb.compress {
-                                hbb_common::compress::decompress(&cb.content)
-                            } else {
-                                cb.content.into()
-                            };
-                            if let Ok(content) = String::from_utf8(content) {
-                                let data =
-                                    HashMap::from([("name", "clipboard"), ("content", &content)]);
-                                if let Ok(data) = serde_json::to_string(&data) {
-                                    let _ = crate::flutter::push_global_event(
-                                        crate::flutter::APP_TYPE_MAIN,
-                                        data,
-                                    );
-                                }
-                            }
-                        }
                         #[cfg(target_os = "android")]
                         crate::clipboard::handle_msg_clipboard(cb);
                     }
@@ -3622,35 +3087,6 @@ impl Connection {
                         }
                         _ => {}
                     },
-                    Some(misc::Union::AudioFormat(format)) => {
-                        if !self.disable_audio {
-                            // Drop the audio sender previously.
-                            drop(std::mem::replace(&mut self.audio_sender, None));
-                            self.audio_sender = Some(start_audio_thread());
-                            self.audio_sender
-                                .as_ref()
-                                .map(|a| allow_err!(a.send(MediaData::AudioFormat(format))));
-                        }
-                    }
-                    #[cfg(feature = "flutter")]
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    Some(misc::Union::SwitchSidesRequest(s)) => {
-                        if let Ok(uuid) = uuid::Uuid::from_slice(&s.uuid.to_vec()[..]) {
-                            crate::server::insert_pending_switch_sides_uuid(
-                                self.lr.my_id.clone(),
-                                uuid.clone(),
-                            );
-                            crate::run_me(vec![
-                                "--connect",
-                                &self.lr.my_id,
-                                "--switch_uuid",
-                                uuid.to_string().as_ref(),
-                            ])
-                            .ok();
-                            self.on_close("switch sides", false).await;
-                            return false;
-                        }
-                    }
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::ChangeResolution(r)) => {
                         if !self.view_camera {
@@ -3662,13 +3098,6 @@ impl Connection {
                         if !self.view_camera {
                             self.change_resolution(Some(dr.display as _), &dr.resolution);
                         }
-                    }
-                    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    Some(misc::Union::PluginRequest(p)) => {
-                        let msg =
-                            crate::plugin::handle_client_event(&p.id, &self.lr.my_id, &p.content);
-                        self.send(msg).await;
                     }
                     Some(misc::Union::AutoAdjustFps(fps)) => video_service::VIDEO_QOS
                         .lock()
@@ -3718,32 +3147,6 @@ impl Connection {
                     }
                     _ => {}
                 },
-                Some(message::Union::AudioFrame(frame)) => {
-                    if !self.disable_audio {
-                        if let Some(sender) = &self.audio_sender {
-                            allow_err!(sender.send(MediaData::AudioFrame(Box::new(frame))));
-                        } else {
-                            log::warn!(
-                                "Processing audio frame without the voice call audio sender."
-                            );
-                        }
-                    }
-                }
-                Some(message::Union::VoiceCallRequest(request)) => {
-                    if request.is_connect {
-                        self.voice_call_request_timestamp = Some(
-                            NonZeroI64::new(request.req_timestamp)
-                                .unwrap_or(NonZeroI64::new(get_time()).unwrap()),
-                        );
-                        // Notify the connection manager.
-                        self.send_to_cm(Data::VoiceCallIncoming);
-                    } else {
-                        self.close_voice_call().await;
-                    }
-                }
-                Some(message::Union::VoiceCallResponse(_response)) => {
-                    // TODO: Maybe we can do a voice call from cm directly.
-                }
                 Some(message::Union::ScreenshotRequest(request)) => {
                     if let Some(tx) = self.inner.tx.clone() {
                         crate::video_service::set_take_screenshot(
@@ -4514,48 +3917,6 @@ impl Connection {
         }
     }
 
-    pub async fn handle_voice_call(&mut self, accepted: bool) {
-        if let Some(ts) = self.voice_call_request_timestamp.take() {
-            let msg = new_voice_call_response(ts.get(), accepted);
-            if accepted {
-                crate::audio_service::set_voice_call_input_device(
-                    crate::get_default_sound_input(),
-                    false,
-                );
-                self.send_to_cm(Data::StartVoiceCall);
-            } else {
-                self.send_to_cm(Data::CloseVoiceCall("".to_owned()));
-            }
-            self.send(msg).await;
-            self.voice_calling = accepted;
-            if self.is_authed_view_camera_conn() {
-                if let Some(s) = self.server.upgrade() {
-                    s.write().unwrap().subscribe(
-                        super::audio_service::NAME,
-                        self.inner.clone(),
-                        self.audio_enabled() && accepted,
-                    );
-                }
-            }
-        } else {
-            log::warn!("Possible a voice call attack.");
-        }
-    }
-
-    pub async fn close_voice_call(&mut self) {
-        crate::audio_service::set_voice_call_input_device(None, true);
-        // Notify the connection manager that the voice call has been closed.
-        self.send_to_cm(Data::CloseVoiceCall("".to_owned()));
-        self.voice_calling = false;
-        if self.is_authed_view_camera_conn() {
-            if let Some(s) = self.server.upgrade() {
-                s.write()
-                    .unwrap()
-                    .subscribe(super::audio_service::NAME, self.inner.clone(), false);
-            }
-        }
-    }
-
     async fn update_options(&mut self, o: &OptionMessage) {
         log::info!("Option update: {:?}", o);
         if let Ok(q) = o.image_quality.enum_value() {
@@ -4629,23 +3990,6 @@ impl Connection {
         if let Ok(q) = o.disable_audio.enum_value() {
             if q != BoolOption::NotSet {
                 self.disable_audio = q == BoolOption::Yes;
-                if let Some(s) = self.server.upgrade() {
-                    if self.is_authed_view_camera_conn() {
-                        if self.voice_calling || !self.audio_enabled() {
-                            s.write().unwrap().subscribe(
-                                super::audio_service::NAME,
-                                self.inner.clone(),
-                                self.audio_enabled(),
-                            );
-                        }
-                    } else {
-                        s.write().unwrap().subscribe(
-                            super::audio_service::NAME,
-                            self.inner.clone(),
-                            self.audio_enabled(),
-                        );
-                    }
-                }
             }
         }
         #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
@@ -4751,50 +4095,6 @@ impl Connection {
         if let Ok(q) = o.terminal_persistent.enum_value() {
             if q != BoolOption::NotSet {
                 self.update_terminal_persistence(q == BoolOption::Yes).await;
-            }
-        }
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if let Ok(q) = o.show_my_cursor.enum_value() {
-            if q != BoolOption::NotSet {
-                use crate::whiteboard;
-                self.show_my_cursor = q == BoolOption::Yes;
-                #[cfg(target_os = "windows")]
-                let is_lower_win10 = !crate::platform::windows::is_win_10_or_greater();
-                #[cfg(not(target_os = "windows"))]
-                let is_lower_win10 = false;
-                #[cfg(target_os = "linux")]
-                let is_linux_supported = crate::whiteboard::is_supported();
-                #[cfg(not(target_os = "linux"))]
-                let is_linux_supported = false;
-                let not_support_msg = if is_lower_win10 {
-                    "Windows 10 or greater is required."
-                } else if cfg!(target_os = "linux") && !is_linux_supported {
-                    "This feature is not supported on native Wayland, please install XWayland or switch to X11."
-                } else {
-                    ""
-                };
-                if q == BoolOption::Yes {
-                    if not_support_msg.is_empty() {
-                        whiteboard::register_whiteboard(whiteboard::get_key_cursor(self.inner.id));
-                    } else {
-                        let mut msg_out = Message::new();
-                        let res = MessageBox {
-                            msgtype: "nook-nocancel-hasclose".to_owned(),
-                            title: "Show my cursor".to_owned(),
-                            text: not_support_msg.to_owned(),
-                            link: "".to_owned(),
-                            ..Default::default()
-                        };
-                        msg_out.set_message_box(res);
-                        self.send(msg_out).await;
-                    }
-                } else {
-                    if not_support_msg.is_empty() {
-                        whiteboard::unregister_whiteboard(whiteboard::get_key_cursor(
-                            self.inner.id,
-                        ));
-                    }
-                }
             }
         }
     }
@@ -4939,23 +4239,13 @@ impl Connection {
             return;
         }
         self.closed = true;
-        // If voice A,B -> C, and A,B has voice call
-        // B disconnects, C will reset the voice call input.
-        //
-        // It may be acceptable, because it's not a common case,
-        // and it's immediately known when the input device changes.
-        // C can change the input device manually in cm interface.
-        //
-        // We can add a (Vec<conn_id>, input device) to avoid this.
-        // But it's not necessary now and we have to consider two audio services(client, server).
-        crate::audio_service::set_voice_call_input_device(None, true);
         log::info!("#{} Connection closed: {}", self.inner.id(), reason);
         if lock && self.lock_after_session_end && self.keyboard {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             lock_screen().await;
         }
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        let data = if self.chat_unanswered || self.file_transferred && cfg!(feature = "flutter") {
+        let data = if self.chat_unanswered {
             ipc::Data::Disconnected
         } else {
             ipc::Data::Close
@@ -5850,32 +5140,6 @@ impl Connection {
         try_empty_clipboard_files(ClipboardSide::Host, self.inner.id());
     }
 
-    #[cfg(all(target_os = "windows", feature = "flutter"))]
-    async fn send_printer_request(&mut self, data: Vec<u8>) {
-        // This path is only used to identify the printer job.
-        let path = format!("RustDesk://FsJob//Printer/{}", get_time());
-
-        let msg = fs::new_send(0, fs::JobType::Printer, path.clone(), 1, false);
-        self.send(msg).await;
-        self.printer_data
-            .retain(|(t, _, _)| t.elapsed().as_secs() < 60);
-        self.printer_data.push((Instant::now(), path, data));
-    }
-
-    #[cfg(all(target_os = "windows", feature = "flutter"))]
-    async fn send_remote_printing_disallowed(&mut self) {
-        let mut msg_out = Message::new();
-        let res = MessageBox {
-            msgtype: "custom-nook-nocancel-hasclose".to_owned(),
-            title: "remote-printing-disallowed-tile-tip".to_owned(),
-            text: "remote-printing-disallowed-text-tip".to_owned(),
-            link: "".to_owned(),
-            ..Default::default()
-        };
-        msg_out.set_message_box(res);
-        self.send(msg_out).await;
-    }
-
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     async fn update_terminal_persistence(&mut self, persistent: bool) {
         self.terminal_persistent = persistent;
@@ -5936,36 +5200,6 @@ impl Connection {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn insert_switch_sides_uuid(id: String, uuid: uuid::Uuid) {
-    SWITCH_SIDES_UUID
-        .lock()
-        .unwrap()
-        .insert(id, (tokio::time::Instant::now(), uuid));
-}
-
-#[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn insert_pending_switch_sides_uuid(id: String, uuid: uuid::Uuid) {
-    let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
-    uuids.retain(|_, (instant, _)| instant.elapsed() < Duration::from_secs(10));
-    uuids.insert(id, (tokio::time::Instant::now(), uuid));
-}
-
-#[cfg(feature = "flutter")]
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn remove_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
-    let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
-    uuids.retain(|_, (instant, _)| instant.elapsed() < Duration::from_secs(10));
-    if uuids.get(id).map(|(_, stored_uuid)| stored_uuid == uuid) == Some(true) {
-        uuids.remove(id);
-        true
-    } else {
-        false
     }
 }
 
@@ -6212,7 +5446,6 @@ pub enum AlarmAuditType {
     TerminalOsLoginBackoff = 7,
     TerminalOsLoginConcurrency = 8,
     SessionScopeViolation = 9,
-    IdWhitelist = 10,
 }
 
 pub enum FileAuditType {
@@ -6386,19 +5619,6 @@ fn start_wakelock_thread() -> std::sync::mpsc::Sender<(usize, usize)> {
         }
     });
     tx
-}
-
-#[cfg(all(target_os = "windows", feature = "flutter"))]
-pub fn on_printer_data(data: Vec<u8>) {
-    crate::server::AUTHED_CONNS
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|c| c.printer)
-        .next()
-        .map(|c| {
-            c.sender.send(Data::PrinterData(data)).ok();
-        });
 }
 
 #[cfg(windows)]
@@ -6793,11 +6013,6 @@ mod raii {
                 scrap::wayland::pipewire::try_close_session();
             }
             Self::check_wake_lock();
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            {
-                use crate::whiteboard;
-                whiteboard::unregister_whiteboard(whiteboard::get_key_cursor(self.0));
-            }
         }
     }
 
@@ -6830,219 +6045,10 @@ mod raii {
     }
 }
 
-// An empty whitelist allows everyone.
-//
-// A peer connecting across servers reports `<its id>@<its own server>` (see
-// `create_login_msg`), so the bare id is matched as well. That suffix is self-asserted and
-// unsigned, so matching only the full form would reject the honest cross-server peer while
-// an attacker just reports the bare id: it can produce false rejects but no true ones.
-fn id_whitelist_allows(id_whitelist: &[String], my_id: &str) -> bool {
-    if id_whitelist.is_empty() {
-        return true;
-    }
-    let bare_id = my_id.split('@').next().unwrap_or(my_id);
-    id_whitelist
-        .iter()
-        .any(|x| wildcard_match(x, my_id) || wildcard_match(x, bare_id))
-}
-
-// Drop `keys` whose last failure (`.0`, in minutes) is at least `window` old. A backwards
-// clock gives a negative age and keeps the entry, so it never widens access.
-fn decay_stale_failures(
-    failures: &mut HashMap<String, (i32, i32, i32)>,
-    keys: &[String],
-    now: i32,
-    window: i32,
-) {
-    for key in keys {
-        if failures
-            .get(key)
-            .is_some_and(|v| now.saturating_sub(v.0) >= window)
-        {
-            failures.remove(key);
-        }
-    }
-}
-
-// Unconditionally forget `keys`, unlike `update_failure`'s remove path which requires the
-// per-address entry to exist.
-fn clear_failures(failures: &mut HashMap<String, (i32, i32, i32)>, keys: &[String]) {
-    for key in keys {
-        failures.remove(key);
-    }
-}
-
-// Simple glob matching for the ID whitelist: '*' matches any sequence of characters
-// (including the empty one), '?' matches exactly one character. Case-insensitive.
-fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.trim().to_lowercase().chars().collect();
-    let t: Vec<char> = text.trim().to_lowercase().chars().collect();
-    let (mut pi, mut ti) = (0, 0);
-    let mut star: Option<(usize, usize)> = None;
-    while ti < t.len() {
-        if pi < p.len() && p[pi] == '*' {
-            star = Some((pi + 1, ti));
-            pi += 1;
-        } else if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if let Some((sp, st)) = star {
-            pi = sp;
-            ti = st + 1;
-            star = Some((sp, st + 1));
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
-
 #[cfg(test)]
 mod test {
     #[allow(unused)]
     use super::*;
-
-    #[test]
-    fn test_wildcard_match() {
-        // Exact match.
-        assert!(wildcard_match("123456789", "123456789"));
-        assert!(!wildcard_match("123456789", "123456780"));
-        assert!(!wildcard_match("12345678", "123456789"));
-        assert!(!wildcard_match("123456789", "12345678"));
-        // Case-insensitive.
-        assert!(wildcard_match("MyCustomId", "mycustomid"));
-        // '*' matches any sequence.
-        assert!(wildcard_match("*", "123456789"));
-        assert!(wildcard_match("*", ""));
-        assert!(wildcard_match("*", "*abc"));
-        assert!(wildcard_match("123*", "123456789"));
-        assert!(wildcard_match("123*", "123"));
-        assert!(wildcard_match("12*", "12*9"));
-        assert!(!wildcard_match("123*", "124456789"));
-        assert!(wildcard_match("*789", "123456789"));
-        assert!(wildcard_match("1*9", "123456789"));
-        assert!(wildcard_match("1*4*9", "123456789"));
-        assert!(!wildcard_match("1*4*9", "123456780"));
-        assert!(wildcard_match("*456*", "123456789"));
-        // '?' matches exactly one character.
-        assert!(wildcard_match("12345678?", "123456789"));
-        assert!(!wildcard_match("123456789?", "123456789"));
-        assert!(wildcard_match("???456???", "123456789"));
-        assert!(wildcard_match("1?3*7?9", "123456789"));
-        // Whitespace around entries is ignored.
-        assert!(wildcard_match(" 123456789 ", "123456789"));
-    }
-
-    #[test]
-    fn test_decay_stale_failures() {
-        let entry = |minute: i32| (minute, 1, 40);
-        let keys = ["ip".to_string(), "p64".to_string(), "absent".to_string()];
-        let mut m: HashMap<String, (i32, i32, i32)> = HashMap::new();
-        m.insert("ip".to_string(), entry(100));
-        m.insert("p64".to_string(), entry(160));
-        m.insert("untouched".to_string(), entry(100));
-
-        // Exactly at the window: forgotten. Still inside it: kept.
-        decay_stale_failures(&mut m, &keys, 160, 60);
-        assert!(!m.contains_key("ip"));
-        assert!(m.contains_key("p64"));
-        // Keys that were not passed in are never visited, absent ones are a no-op.
-        assert!(m.contains_key("untouched"));
-
-        // One minute short of the window keeps the entry.
-        decay_stale_failures(&mut m, &keys, 219, 60);
-        assert!(m.contains_key("p64"));
-        decay_stale_failures(&mut m, &keys, 220, 60);
-        assert!(!m.contains_key("p64"));
-
-        // A clock that jumped backwards must not drop anything.
-        m.insert("ip".to_string(), entry(500));
-        decay_stale_failures(&mut m, &keys, 0, 60);
-        assert!(m.contains_key("ip"));
-    }
-
-    #[test]
-    fn test_clear_failures_drops_shared_prefixes() {
-        // On IPv6 a whitelisted peer usually has no entry of its own, while the shared
-        // prefixes that block it do. Clearing must not depend on the per-address entry.
-        let mut m: HashMap<String, (i32, i32, i32)> = HashMap::new();
-        m.insert("p64".to_string(), (100, 1, 55));
-        m.insert("p56".to_string(), (100, 1, 75));
-        m.insert("p48".to_string(), (100, 1, 95));
-        m.insert("someone-else".to_string(), (100, 1, 95));
-        let keys = ["ip", "p64", "p56", "p48"].map(|k| k.to_string());
-
-        clear_failures(&mut m, &keys);
-
-        for key in ["p64", "p56", "p48"] {
-            assert!(!m.contains_key(key), "{key} should have been cleared");
-        }
-        // Keys belonging to other peers are left alone.
-        assert!(m.contains_key("someone-else"));
-    }
-
-    #[test]
-    fn test_id_whitelist_allows() {
-        let list = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-
-        // An empty whitelist allows everyone.
-        assert!(id_whitelist_allows(&[], "123456789"));
-
-        // Same server: the peer reports a bare id.
-        assert!(id_whitelist_allows(&list(&["123456789"]), "123456789"));
-        assert!(!id_whitelist_allows(&list(&["123456789"]), "987654321"));
-
-        // Cross server: the peer appends its own server, which must not reject it.
-        assert!(id_whitelist_allows(
-            &list(&["123456789"]),
-            "123456789@example.com:21116"
-        ));
-        // Cross server from web, whose server is a WebSocket URI.
-        assert!(id_whitelist_allows(
-            &list(&["123456789"]),
-            "123456789@wss://example.com:21118/ws/id"
-        ));
-        // A different id is still rejected, suffix or not.
-        assert!(!id_whitelist_allows(
-            &list(&["123456789"]),
-            "987654321@example.com:21116"
-        ));
-
-        // An entry pinned to one server keeps matching that exact form.
-        assert!(id_whitelist_allows(
-            &list(&["123456789@example.com:21116"]),
-            "123456789@example.com:21116"
-        ));
-        assert!(!id_whitelist_allows(
-            &list(&["123456789@example.com:21116"]),
-            "123456789@other.com:21116"
-        ));
-        // ... and no longer matches the bare id, which is the point of pinning.
-        assert!(!id_whitelist_allows(
-            &list(&["123456789@example.com:21116"]),
-            "123456789"
-        ));
-
-        // Wildcards keep working on both forms.
-        assert!(id_whitelist_allows(&list(&["abc*"]), "abcdef"));
-        assert!(id_whitelist_allows(
-            &list(&["abc*"]),
-            "abcdef@example.com:21116"
-        ));
-        assert!(id_whitelist_allows(
-            &list(&["*"]),
-            "123456789@example.com:21116"
-        ));
-
-        // Any entry of the list is enough.
-        assert!(id_whitelist_allows(
-            &list(&["111111111", "123456789", "222222222"]),
-            "123456789@example.com:21116"
-        ));
-    }
 
     #[cfg(target_os = "macos")]
     #[test]

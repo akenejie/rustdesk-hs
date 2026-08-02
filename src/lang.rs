@@ -104,11 +104,7 @@ pub const LANGS: &[(&str, &str)] = &[
 ];
 
 pub(crate) fn cjk_ui_unavailable() -> bool {
-    cfg!(all(
-        target_os = "linux",
-        target_arch = "aarch64",
-        feature = "flutter"
-    ))
+    cfg!(all(target_os = "linux", target_arch = "aarch64"))
 }
 
 pub(crate) fn is_cjk_lang(lang_or_locale: &str) -> bool {

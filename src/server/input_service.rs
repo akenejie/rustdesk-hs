@@ -2,8 +2,6 @@
 use super::rdp_input::client::{RdpInputKeyboard, RdpInputMouse};
 use super::*;
 use crate::input::*;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use crate::whiteboard;
 #[cfg(target_os = "macos")]
 use dispatch::Queue;
 use enigo::{Enigo, Key, KeyboardControllable, MouseButton, MouseControllable};
@@ -1044,18 +1042,6 @@ pub fn handle_mouse_(
     if simulate {
         handle_mouse_simulation_(evt, conn);
     }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        let evt_type = evt.mask & MOUSE_TYPE_MASK;
-        // Relative (delta) mouse events do not include absolute coordinates, so
-        // whiteboard/cursor rendering must be disabled during relative mode to prevent
-        // incorrect cursor/whiteboard updates. We check both is_relative_mouse_active(conn)
-        // (connection already in relative mode from prior events) and evt_type (current
-        // event is relative) to guard against the first relative event before the flag is set.
-        if _show_cursor && !is_relative_mouse_active(conn) && evt_type != MOUSE_TYPE_MOVE_RELATIVE {
-            handle_mouse_show_cursor_(evt, conn, _username, _argb);
-        }
-    }
 }
 
 pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
@@ -1237,52 +1223,6 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
     #[cfg(not(target_os = "macos"))]
     for key in to_release {
         en.key_up(key.clone());
-    }
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn handle_mouse_show_cursor_(evt: &MouseEvent, conn: i32, username: String, argb: u32) {
-    let buttons = evt.mask >> 3;
-    let evt_type = evt.mask & MOUSE_TYPE_MASK;
-    match evt_type {
-        MOUSE_TYPE_MOVE => {
-            whiteboard::update_whiteboard(
-                whiteboard::get_key_cursor(conn),
-                whiteboard::CustomEvent::Cursor(whiteboard::Cursor {
-                    x: evt.x as _,
-                    y: evt.y as _,
-                    argb,
-                    btns: 0,
-                    text: username,
-                }),
-            );
-        }
-        MOUSE_TYPE_UP => {
-            if buttons == MOUSE_BUTTON_LEFT {
-                // Some clients intentionally send button events without coordinates.
-                // Fall back to the last known cursor position to avoid jumping to (0, 0).
-                // TODO(protocol): (0, 0) is a valid screen coordinate. Consider using a dedicated
-                // sentinel value (e.g. INVALID_CURSOR_POS) or a protocol-level flag to distinguish
-                // "coordinates not provided" from "coordinates are (0, 0)". Impact is minor since
-                // this only affects whiteboard rendering and clicking exactly at (0, 0) is rare.
-                let (x, y) = if evt.x == 0 && evt.y == 0 {
-                    get_last_input_cursor_pos()
-                } else {
-                    (evt.x, evt.y)
-                };
-                whiteboard::update_whiteboard(
-                    whiteboard::get_key_cursor(conn),
-                    whiteboard::CustomEvent::Cursor(whiteboard::Cursor {
-                        x: x as _,
-                        y: y as _,
-                        argb,
-                        btns: buttons,
-                        text: username,
-                    }),
-                );
-            }
-        }
-        _ => {}
     }
 }
 

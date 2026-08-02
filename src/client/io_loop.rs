@@ -1,15 +1,13 @@
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::clipboard::{update_clipboard, ClipboardSide};
-#[cfg(not(any(target_os = "ios")))]
-use crate::{audio_service, clipboard::CLIPBOARD_INTERVAL, ConnInner, CLIENT_SERVER};
 use crate::{
     client::{
-        self, new_voice_call_request, Client, Data, Interface, MediaData, MediaSender,
-        QualityStatus, MILLI1, SEC30,
+        self, Client, Data, Interface, MediaData, MediaSender, QualityStatus, MILLI1, SEC30,
     },
-    common::get_default_sound_input,
     ui_session_interface::{InvokeUiSession, Session},
 };
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use crate::clipboard::CLIPBOARD_INTERVAL;
 
 // Empirical no-data window before exposing the restart reconnect state to the UI.
 // Restart msgbox text is kept as a legacy UI fallback; Flutter handles the type as a control event.
@@ -23,8 +21,6 @@ use crate::{clipboard::try_empty_clipboard_files, clipboard_file::unix_file_clip
 ))]
 use clipboard::ContextSend;
 use crossbeam_queue::ArrayQueue;
-#[cfg(not(target_os = "ios"))]
-use hbb_common::tokio::sync::mpsc::error::TryRecvError;
 use hbb_common::{
     allow_err,
     config::{self, LocalConfig, PeerConfig, TransferSerde},
@@ -32,7 +28,7 @@ use hbb_common::{
         self, can_enable_overwrite_detection, get_job, get_string, new_send_confirm,
         DigestCheckResult, RemoveJobMeta,
     },
-    get_time, log,
+    log,
     message_proto::{permission_info::Permission, *},
     protobuf::Message as _,
     rendezvous_proto::ConnType,
@@ -50,7 +46,6 @@ use scrap::CodecFormat;
 use std::{
     collections::HashMap,
     ffi::c_void,
-    num::NonZeroI64,
     path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -60,12 +55,8 @@ use std::{
 
 pub struct Remote<T: InvokeUiSession> {
     handler: Session<T>,
-    audio_sender: MediaSender,
     receiver: mpsc::UnboundedReceiver<Data>,
     sender: mpsc::UnboundedSender<Data>,
-    // Stop sending local audio to remote client.
-    stop_voice_call_sender: Option<std::sync::mpsc::Sender<()>>,
-    voice_call_request_timestamp: Option<NonZeroI64>,
     read_jobs: Vec<fs::TransferJob>,
     write_jobs: Vec<fs::TransferJob>,
     remove_jobs: HashMap<i32, RemoveJob>,
@@ -110,7 +101,6 @@ impl<T: InvokeUiSession> Remote<T> {
     ) -> Self {
         Self {
             handler,
-            audio_sender: crate::client::start_audio_thread(),
             receiver,
             sender,
             read_jobs: Vec::new(),
@@ -124,8 +114,6 @@ impl<T: InvokeUiSession> Remote<T> {
             client_conn_id: 0,
             data_count: Arc::new(AtomicUsize::new(0)),
             video_format: CodecFormat::Unknown,
-            stop_voice_call_sender: None,
-            voice_call_request_timestamp: None,
             elevation_requested: false,
             peer_info: Default::default(),
             video_threads: Default::default(),
@@ -147,10 +135,6 @@ impl<T: InvokeUiSession> Remote<T> {
                     f: Box::new(|| {
                         // No need to call `enable(false)` for sciter version, because each client of sciter version is a new process.
                         // It's better to check if the peers are windows(support file copy&paste), but it's not necessary.
-                        #[cfg(feature = "flutter")]
-                        if !crate::flutter::sessions::has_sessions_running(ConnType::DEFAULT_CONN) {
-                            ContextSend::enable(false);
-                        };
                     }),
                 })
             } else {
@@ -342,10 +326,6 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
                 log::debug!("Exit io_loop of id={}", self.handler.get_id());
-                // Stop client audio server.
-                if let Some(s) = self.stop_voice_call_sender.take() {
-                    s.send(()).ok();
-                }
                 if kcp.is_some() {
                     // Send the close reason if it hasn't been sent yet, as KCP cannot detect the socket close event.
                     self.send_close_reason(&mut peer, "kcp").await;
@@ -463,93 +443,6 @@ impl<T: InvokeUiSession> Remote<T> {
         }
     }
 
-    fn stop_voice_call(&mut self) {
-        let voice_call_sender = std::mem::replace(&mut self.stop_voice_call_sender, None);
-        if let Some(stopper) = voice_call_sender {
-            let _ = stopper.send(());
-        }
-    }
-
-    // Start a voice call recorder, records audio and send to remote
-    fn start_voice_call(&mut self) -> Option<std::sync::mpsc::Sender<()>> {
-        if self.handler.is_file_transfer()
-            || self.handler.is_port_forward()
-            || self.handler.is_terminal()
-        {
-            return None;
-        }
-        // iOS does not have this server.
-        #[cfg(not(any(target_os = "ios")))]
-        {
-            // NOTE:
-            // The client server and --server both use the same sound input device.
-            // It's better to distinguish the server side and client side.
-            // But it' not necessary for now, because it's not a common case.
-            // And it is immediately known when the input device is changed.
-            crate::audio_service::set_voice_call_input_device(get_default_sound_input(), false);
-            // Create a channel to receive error or closed message
-            let (tx, rx) = std::sync::mpsc::channel();
-            let (tx_audio_data, mut rx_audio_data) =
-                hbb_common::tokio::sync::mpsc::unbounded_channel();
-            // Create a stand-alone inner, add subscribe to audio service
-            let conn_id = CLIENT_SERVER.write().unwrap().get_new_id();
-            let client_conn_inner = ConnInner::new(conn_id.clone(), Some(tx_audio_data), None);
-            // now we subscribe
-            CLIENT_SERVER.write().unwrap().subscribe(
-                audio_service::NAME,
-                client_conn_inner.clone(),
-                true,
-            );
-            let tx_audio = self.sender.clone();
-            std::thread::spawn(move || {
-                loop {
-                    // check if client is closed
-                    match rx.try_recv() {
-                        Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            log::debug!("Exit voice call audio service of client");
-                            // unsubscribe
-                            CLIENT_SERVER.write().unwrap().subscribe(
-                                audio_service::NAME,
-                                client_conn_inner,
-                                false,
-                            );
-                            crate::audio_service::set_voice_call_input_device(None, true);
-                            break;
-                        }
-                        _ => {}
-                    }
-                    match rx_audio_data.try_recv() {
-                        Ok((_instant, msg)) => match &msg.union {
-                            Some(message::Union::AudioFrame(frame)) => {
-                                let mut msg = Message::new();
-                                msg.set_audio_frame(frame.clone());
-                                tx_audio.send(Data::Message(msg)).ok();
-                            }
-                            Some(message::Union::Misc(misc)) => {
-                                let mut msg = Message::new();
-                                msg.set_misc(misc.clone());
-                                tx_audio.send(Data::Message(msg)).ok();
-                            }
-                            _ => {}
-                        },
-                        Err(err) => {
-                            if err == TryRecvError::Empty {
-                                // ignore
-                            } else {
-                                log::debug!("Failed to record local audio channel: {}", err);
-                            }
-                        }
-                    }
-                }
-            });
-            return Some(tx);
-        }
-        #[cfg(target_os = "ios")]
-        {
-            None
-        }
-    }
-
     async fn send_close_reason(&mut self, peer: &mut Stream, reason: &str) {
         if self.sent_close_reason {
             return;
@@ -573,7 +466,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     .handle_login_from_ui(os_username, os_password, password, remember, peer)
                     .await;
             }
-            #[cfg(all(target_os = "windows", not(feature = "flutter")))]
+            #[cfg(target_os = "windows")]
             Data::ToggleClipboardFile => {
                 self.check_clipboard_file_context();
             }
@@ -978,23 +871,6 @@ impl<T: InvokeUiSession> Remote<T> {
                 allow_err!(peer.send(&msg).await);
                 self.elevation_requested = true;
             }
-            Data::NewVoiceCall => {
-                let msg = new_voice_call_request(true);
-                // Save the voice call request timestamp for the further validation.
-                self.voice_call_request_timestamp = Some(
-                    NonZeroI64::new(msg.voice_call_request().req_timestamp)
-                        .unwrap_or(NonZeroI64::new(get_time()).unwrap()),
-                );
-                allow_err!(peer.send(&msg).await);
-                self.handler.on_voice_call_waiting();
-            }
-            Data::CloseVoiceCall => {
-                self.stop_voice_call();
-                let msg = new_voice_call_request(false);
-                self.handler
-                    .on_voice_call_closed("Closed manually by the peer");
-                allow_err!(peer.send(&msg).await);
-            }
             Data::ResetDecoder(display) => match display {
                 Some(display) => {
                     if let Some(v) = self.video_threads.get_mut(&display) {
@@ -1384,13 +1260,9 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         self.handler.handle_peer_info(pi);
-                        #[cfg(all(target_os = "windows", not(feature = "flutter")))]
+                        #[cfg(target_os = "windows")]
                         self.check_clipboard_file_context();
                         if self.handler.is_default() {
-                            #[cfg(feature = "flutter")]
-                            #[cfg(not(target_os = "ios"))]
-                            let rx = Client::try_start_clipboard(None);
-                            #[cfg(not(feature = "flutter"))]
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
                             let rx = Client::try_start_clipboard(Some(
                                 crate::client::ClientClipboardContext {
@@ -1426,21 +1298,6 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                             // to-do: Android, is `sync_init_clipboard` really needed?
                             // https://github.com/rustdesk/rustdesk/discussions/9010
-
-                            #[cfg(feature = "flutter")]
-                            #[cfg(not(target_os = "ios"))]
-                            crate::flutter::update_text_clipboard_required();
-
-                            #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
-                            crate::flutter::update_file_clipboard_required();
-
-                            // on connection established client
-                            #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-                            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                            crate::plugin::handle_listen_event(
-                                crate::plugin::EVENT_ON_CONN_CLIENT.to_owned(),
-                                self.handler.get_id(),
-                            );
                         }
 
                         if self.handler.is_file_transfer() {
@@ -1783,9 +1640,6 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
                 Some(message::Union::Misc(misc)) => match misc.union {
-                    Some(misc::Union::AudioFormat(f)) => {
-                        self.audio_sender.send(MediaData::AudioFormat(f)).ok();
-                    }
                     Some(misc::Union::ChatMessage(c)) => {
                         self.handler.new_message(c.text);
                     }
@@ -1795,22 +1649,11 @@ impl<T: InvokeUiSession> Remote<T> {
                         match p.permission.enum_value() {
                             Ok(Permission::Keyboard) => {
                                 *self.handler.server_keyboard_enabled.write().unwrap() = p.enabled;
-                                #[cfg(feature = "flutter")]
-                                #[cfg(not(target_os = "ios"))]
-                                crate::flutter::update_text_clipboard_required();
-                                #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
-                                crate::flutter::update_file_clipboard_required();
                                 self.handler.set_permission("keyboard", p.enabled);
                             }
                             Ok(Permission::Clipboard) => {
                                 *self.handler.server_clipboard_enabled.write().unwrap() = p.enabled;
-                                #[cfg(feature = "flutter")]
-                                #[cfg(not(target_os = "ios"))]
-                                crate::flutter::update_text_clipboard_required();
                                 self.handler.set_permission("clipboard", p.enabled);
-                            }
-                            Ok(Permission::Audio) => {
-                                self.handler.set_permission("audio", p.enabled);
                             }
                             Ok(Permission::File) => {
                                 *self.handler.server_file_transfer_enabled.write().unwrap() =
@@ -1818,8 +1661,6 @@ impl<T: InvokeUiSession> Remote<T> {
                                 if !p.enabled && self.handler.is_file_transfer() {
                                     return true;
                                 }
-                                #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
-                                crate::flutter::update_file_clipboard_required();
                                 self.handler.set_permission("file", p.enabled);
                                 #[cfg(feature = "unix-file-copy-paste")]
                                 if !p.enabled {
@@ -1882,22 +1723,6 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     Some(misc::Union::Uac(uac)) => {
                         let keyboard = self.handler.server_keyboard_enabled.read().unwrap().clone();
-                        #[cfg(feature = "flutter")]
-                        {
-                            if uac && keyboard {
-                                self.handler.msgbox(
-                                    "on-uac",
-                                    "Prompt",
-                                    "Please wait for confirmation of UAC...",
-                                    "",
-                                );
-                            } else {
-                                self.handler.cancel_msgbox("on-uac");
-                                self.handler.cancel_msgbox("wait-uac");
-                                self.handler.cancel_msgbox("elevation-error");
-                            }
-                        }
-                        #[cfg(not(feature = "flutter"))]
                         {
                             let msgtype = "custom-uac-nocancel";
                             let title = "Prompt";
@@ -1915,22 +1740,6 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     Some(misc::Union::ForegroundWindowElevated(elevated)) => {
                         let keyboard = self.handler.server_keyboard_enabled.read().unwrap().clone();
-                        #[cfg(feature = "flutter")]
-                        {
-                            if elevated && keyboard {
-                                self.handler.msgbox(
-                                    "on-foreground-elevated",
-                                    "Prompt",
-                                    "elevated_foreground_window_tip",
-                                    "",
-                                );
-                            } else {
-                                self.handler.cancel_msgbox("on-foreground-elevated");
-                                self.handler.cancel_msgbox("wait-uac");
-                                self.handler.cancel_msgbox("elevation-error");
-                            }
-                        }
-                        #[cfg(not(feature = "flutter"))]
                         {
                             let msgtype = "custom-elevated-foreground-nocancel";
                             let title = "Prompt";
@@ -1966,44 +1775,6 @@ impl<T: InvokeUiSession> Remote<T> {
                             );
                         }
                     }
-                    #[cfg(feature = "flutter")]
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    Some(misc::Union::SwitchBack(_)) => {
-                        let allow_switch_back = self
-                            .handler
-                            .lc
-                            .write()
-                            .unwrap()
-                            .consume_switch_back_permission();
-                        if allow_switch_back {
-                            self.handler.switch_back(&self.handler.get_id());
-                        } else {
-                            log::warn!(
-                                "Ignored unsolicited SwitchBack from {}",
-                                self.handler.get_id()
-                            );
-                        }
-                    }
-                    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    Some(misc::Union::PluginRequest(p)) => {
-                        allow_err!(crate::plugin::handle_server_event(
-                            &p.id,
-                            &self.handler.get_id(),
-                            &p.content
-                        ));
-                        // to-do: show message box on UI when error occurs?
-                    }
-                    #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    Some(misc::Union::PluginFailure(p)) => {
-                        let name = if p.name.is_empty() {
-                            "plugin".to_string()
-                        } else {
-                            p.name
-                        };
-                        self.handler.msgbox("custom-nocancel", &name, &p.msg, "");
-                    }
                     Some(misc::Union::SupportedEncoding(e)) => {
                         log::info!("update supported encoding:{:?}", e);
                         self.handler.lc.write().unwrap().supported_encoding = e;
@@ -2016,32 +1787,15 @@ impl<T: InvokeUiSession> Remote<T> {
                 Some(message::Union::TestDelay(t)) => {
                     self.handler.handle_test_delay(t, peer).await;
                 }
-                Some(message::Union::AudioFrame(frame)) => {
-                    if !self.handler.lc.read().unwrap().disable_audio.v {
-                        self.audio_sender
-                            .send(MediaData::AudioFrame(Box::new(frame)))
-                            .ok();
-                    }
-                }
                 Some(message::Union::FileAction(action)) => match action.union {
                     Some(file_action::Union::Send(_s)) => match _s.file_type.enum_value() {
                         #[cfg(target_os = "windows")]
                         Ok(file_transfer_send_request::FileType::Printer) => {
-                            #[cfg(feature = "flutter")]
-                            let action = LocalConfig::get_option(
-                                config::keys::OPTION_PRINTER_INCOMING_JOB_ACTION,
-                            );
-                            #[cfg(not(feature = "flutter"))]
                             let action = "";
                             if action == "dismiss" {
                                 // Just ignore the incoming print job.
                             } else {
                                 let id = fs::get_next_job_id();
-                                #[cfg(feature = "flutter")]
-                                let allow_auto_print = LocalConfig::get_bool_option(
-                                    config::keys::OPTION_PRINTER_ALLOW_AUTO_PRINT,
-                                );
-                                #[cfg(not(feature = "flutter"))]
                                 let allow_auto_print = false;
                                 if allow_auto_print {
                                     let printer_name = if action == "" {
@@ -2076,34 +1830,6 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     self.handler
                         .msgbox(&msgbox.msgtype, &msgbox.title, &msgbox.text, &link);
-                }
-                Some(message::Union::VoiceCallRequest(request)) => {
-                    if request.is_connect {
-                        // TODO: maybe we will do a voice call from the peer in the future.
-                    } else {
-                        log::debug!("The remote has requested to close the voice call");
-                        if let Some(sender) = self.stop_voice_call_sender.take() {
-                            allow_err!(sender.send(()));
-                            self.handler.on_voice_call_closed("");
-                        }
-                    }
-                }
-                Some(message::Union::VoiceCallResponse(response)) => {
-                    let ts = std::mem::replace(&mut self.voice_call_request_timestamp, None);
-                    if let Some(ts) = ts {
-                        if response.req_timestamp != ts.get() {
-                            log::debug!("Possible encountering a voice call attack.");
-                        } else {
-                            if response.accepted {
-                                // The peer accepted the voice call.
-                                self.handler.on_voice_call_started();
-                                self.stop_voice_call_sender = self.start_voice_call();
-                            } else {
-                                // The peer refused the voice call.
-                                self.handler.on_voice_call_closed("");
-                            }
-                        }
-                    }
                 }
                 Some(message::Union::PeerInfo(pi)) => {
                     self.handler.set_displays(&pi.displays);
@@ -2335,7 +2061,7 @@ impl<T: InvokeUiSession> Remote<T> {
         true
     }
 
-    #[cfg(all(target_os = "windows", not(feature = "flutter")))]
+    #[cfg(target_os = "windows")]
     fn check_clipboard_file_context(&self) {
         let enabled = *self.handler.server_file_transfer_enabled.read().unwrap()
             && self.handler.lc.read().unwrap().enable_file_copy_paste.v;
@@ -2349,14 +2075,6 @@ impl<T: InvokeUiSession> Remote<T> {
         _peer: &mut Stream,
     ) {
         log::debug!("handling cliprdr msg from server peer");
-        #[cfg(feature = "flutter")]
-        if let Some(hbb_common::message_proto::cliprdr::Union::FormatList(_)) = &clip.union {
-            if self.client_conn_id
-                != clipboard::get_client_conn_id(&crate::flutter::get_cur_peer_id()).unwrap_or(0)
-            {
-                return;
-            }
-        }
 
         let Some(clip) = crate::clipboard_file::msg_2_clip(clip) else {
             log::warn!("failed to decode cliprdr msg from server peer");
@@ -2452,9 +2170,6 @@ impl<T: InvokeUiSession> Remote<T> {
                 *frame_count.write().unwrap() += 1;
                 if pixelbuffer {
                     handler.on_rgba(display, data);
-                } else {
-                    #[cfg(all(feature = "vram", feature = "flutter"))]
-                    handler.on_texture(display, _texture);
                 }
             },
         );
