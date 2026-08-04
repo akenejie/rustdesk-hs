@@ -120,11 +120,10 @@ jobs:
           # armhf is only served from ports.ubuntu.com (archive/security.ubuntu.com have no armhf at all).
           if [ "${CROSS_ARCH}" == "armhf" ]; then
           # After dpkg --add-architecture armhf, apt also tries to fetch armhf indexes from the
-          # runner's own amd64 sources, which 404. Restrict those sources to amd64 only.
-          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
-          for f in /etc/apt/sources.list.d/*.list; do
-            [ -e "$f" ] && sudo sed -i 's/^deb /deb [arch=amd64] /' "$f"
-          done
+          # runner's own amd64 sources (archive/security.ubuntu.com have no armhf), which 404.
+          # Restrict only the main sources.list to amd64, and skip entries that already carry an
+          # [arch=...] option (e.g. microsoft-prod.list) to avoid malforming them.
+          sudo sed -i '/^deb \[/!s/^deb /deb [arch=amd64] /' /etc/apt/sources.list
           sudo tee /etc/apt/sources.list.d/ports.list >/dev/null <<'EOF'
           deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports/ jammy main universe
           deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main universe
@@ -158,6 +157,8 @@ jobs:
           if [ "${{ matrix.cross }}" == "true" ]; then
             MULTIARCH="$(${{ matrix.cross-gcc }} -print-multiarch)"
             echo "PKG_CONFIG_LIBDIR=/usr/lib/${MULTIARCH}/pkgconfig" >> "$GITHUB_ENV"
+            # The pkg-config crate refuses cross-compilation unless allowed explicitly.
+            echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
           else
             MULTIARCH="$(gcc -print-multiarch)"
           fi
@@ -200,9 +201,12 @@ jobs:
         run: |
           # run-vcpkg sets VCPKG_FORCE_SYSTEM_BINARIES=1 on arm64 hosts (macOS arm64
           # runners), which forces vcpkg onto the Homebrew system cmake (/opt/homebrew/bin/cmake)
-          # and that segfaults in detect_compiler. Unset it so vcpkg uses its bundled
-          # cmake/ninja instead (same path the passing x64 macOS job takes).
+          # and that segfaults in detect_compiler. Unsetting it alone is not enough: vcpkg still
+          # picks the (version-ok) Homebrew cmake from PATH, and only falls back to a download
+          # when no acceptable tool is found. Force the downloaded binaries instead so the bundled
+          # cmake/ninja are downloaded and used, bypassing the segfaulting Homebrew cmake.
           unset VCPKG_FORCE_SYSTEM_BINARIES
+          export VCPKG_FORCE_DOWNLOADED_BINARIES=1
           "$VCPKG_ROOT/vcpkg" install --triplet "${{ matrix.vcpkg-triplet }}" --x-install-root="$VCPKG_ROOT/installed"
 
       - name: Set SODIUM_LIB_DIR (Windows arm64)
