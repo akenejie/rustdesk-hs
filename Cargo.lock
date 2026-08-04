@@ -6203,7 +6203,7 @@ dependencies = [
 
 [[package]]
 name = "rustdesk-hs"
-version = "1.4.9"
+version = "0.1.0"
 dependencies = [
  "android-wakelock",
  "android_logger",

@@ -229,14 +229,32 @@ pub fn gen_version() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     use std::io::prelude::*;
     let mut file = File::create("./src/version.rs").unwrap();
-    for line in read_lines("Cargo.toml").unwrap().flatten() {
-        let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
-        if ab.len() == 2 && ab[0] == "version" {
-            file.write_all(format!("pub const VERSION: &str = {};\n", ab[1]).as_bytes())
-                .ok();
-            break;
+    let lines: Vec<String> = read_lines("Cargo.toml").unwrap().flatten().collect();
+    let mut version = "1.4.9".to_owned();
+    let mut found = false;
+    let mut in_meta = false;
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_meta = trimmed.starts_with("[package.metadata.rustdesk]");
+        } else if in_meta {
+            let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
+            if ab.len() == 2 && ab[0] == "protocol-version" {
+                version = ab[1].trim_matches('"').to_owned();
+                found = true;
+            }
         }
     }
+    if !found {
+        for line in &lines {
+            let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
+            if ab.len() == 2 && ab[0] == "version" {
+                version = ab[1].trim_matches('"').to_owned();
+            }
+        }
+    }
+    file.write_all(format!("pub const VERSION: &str = \"{}\";\n", version).as_bytes())
+        .ok();
     // generate build date
     let build_date = format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
     file.write_all(
