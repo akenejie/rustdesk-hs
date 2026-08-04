@@ -90,8 +90,12 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # bindgen (used by magnum-opus etc.) needs libclang.
+      # bindgen (used by magnum-opus etc.) needs libclang. macOS needs no LLVM download:
+      # Xcode ships clang and libclang, which clang-sys finds via `xcode-select --print-path`.
+      # The action also exports DYLD_LIBRARY_PATH=/usr/lib:<llvm>/lib on arm64 macOS, which
+      # segfaults vcpkg's cmake and breaks Xcode's cc, so skip it on macOS entirely.
       - name: Install LLVM (libclang for bindgen)
+        if: runner.os != 'macOS'
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "16"
@@ -181,7 +185,7 @@ jobs:
 
       - name: (macOS) Install system prerequisites
         if: runner.os == 'macOS'
-        run: brew install nasm yasm automake autoconf libtool
+        run: brew install nasm yasm automake autoconf libtool ninja
 
       # vcpkg provides the codec/system libs on Windows/macOS where there is
       # no system package manager. On Linux the crates use pkg-config instead,
@@ -204,11 +208,12 @@ jobs:
           # Unset it and force vcpkg's downloaded tools so the tool versions are deterministic.
           unset VCPKG_FORCE_SYSTEM_BINARIES
           export VCPKG_FORCE_DOWNLOADED_BINARIES=1
-          # install-llvm-action exports DYLD_LIBRARY_PATH=/usr/lib:<llvm>/lib on arm64 macOS
-          # runners. The leading /usr/lib makes cmake resolve its (bundled/Homebrew) dylibs to the
-          # system copies and segfault during compiler detection (detect_compiler). Keep only the
-          # LLVM lib dir so the LLVM clang set via CC/CXX still finds its dylibs.
-          export DYLD_LIBRARY_PATH="${LLVM_PATH}/lib"
+          # install-llvm-action (now skipped on macOS) exported DYLD_LIBRARY_PATH=/usr/lib:<llvm>/lib
+          # on arm64 macOS. The leading /usr/lib made cmake resolve its bundled dylibs to the system
+          # copies and segfault in detect_compiler; pointing it at <llvm>/lib instead broke Xcode's cc
+          # (LLVM libc++ lacks Apple's weak __ZnwmSt19__type_descriptor_t symbols). With LLVM gone on
+          # macOS, unset the vars so cmake/cc/ninja resolve their dylibs normally. Harmless on Windows.
+          unset DYLD_LIBRARY_PATH
           unset LD_LIBRARY_PATH
           "$VCPKG_ROOT/vcpkg" install --triplet "${{ matrix.vcpkg-triplet }}" --x-install-root="$VCPKG_ROOT/installed" || {
             echo "=== detect_compiler out ==="

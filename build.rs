@@ -1,3 +1,53 @@
+// Generates src/version.rs from Cargo.toml. Inlined from hbb_common so the build script
+// does not depend on hbb_common/sodiumoxide (which would compile libsodium for the host
+// and pick up the target's SODIUM_LIB_DIR, breaking cross-compiles to windows arm64).
+fn gen_version() {
+    use std::io::prelude::*;
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    let mut file = std::fs::File::create("./src/version.rs").unwrap();
+    let lines: Vec<String> = read_lines("Cargo.toml").unwrap().flatten().collect();
+    let mut version = "1.4.9".to_owned();
+    let mut found = false;
+    let mut in_meta = false;
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_meta = trimmed.starts_with("[package.metadata.rustdesk]");
+        } else if in_meta {
+            let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
+            if ab.len() == 2 && ab[0] == "protocol-version" {
+                version = ab[1].trim_matches('"').to_owned();
+                found = true;
+            }
+        }
+    }
+    if !found {
+        for line in &lines {
+            let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
+            if ab.len() == 2 && ab[0] == "version" {
+                version = ab[1].trim_matches('"').to_owned();
+            }
+        }
+    }
+    file.write_all(format!("pub const VERSION: &str = \"{}\";\n", version).as_bytes())
+        .ok();
+    // generate build date
+    let build_date = format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
+    file.write_all(
+        format!("#[allow(dead_code)]\npub const BUILD_DATE: &str = \"{build_date}\";\n").as_bytes(),
+    )
+    .ok();
+    file.sync_all().ok();
+}
+
+fn read_lines<P>(filename: P) -> std::io::Result<std::io::Lines<std::io::BufReader<std::fs::File>>>
+where
+    P: AsRef<std::path::Path>,
+{
+    use std::io::BufRead;
+    let file = std::fs::File::open(filename)?;
+    Ok(std::io::BufReader::new(file).lines())
+}
 #[cfg(windows)]
 fn build_windows() {
     let file = "src/platform/windows.cc";
@@ -78,7 +128,7 @@ fn install_android_deps() {
 }
 
 fn main() {
-    hbb_common::gen_version();
+    gen_version();
     install_android_deps();
     #[cfg(all(windows, feature = "inline"))]
     build_manifest();
