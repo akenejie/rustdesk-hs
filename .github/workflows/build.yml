@@ -3,7 +3,7 @@ name: Build
 # Runtime environment controls which registry/overlay bits vcpkg uses.
 env:
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-  VCPKG_COMMIT_ID: "120deac3062162151622ca3ac877409c66bb93c0" # vcpkg baseline, keep in sync with vcpkg.json
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b" # vcpkg baseline, keep in sync with vcpkg.json
 
 on:
   workflow_dispatch:
@@ -97,6 +97,8 @@ jobs:
       - name: Build (release)
         shell: bash
         run: |
+          # Ubuntu's libyuv-dev does not ship libyuv.pc; use the one bundled here.
+          export PKG_CONFIG_PATH="${GITHUB_WORKSPACE}/ci/linux:${PKG_CONFIG_PATH}"
           cargo build --release --bin rustdesk-hs
 
       - name: (Linux) Prepare portable artifact
