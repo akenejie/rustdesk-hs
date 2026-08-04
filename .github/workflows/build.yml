@@ -73,7 +73,8 @@ jobs:
             vcpkg-triplet: arm64-windows-static
             sodium-lib-dir: true
           - id: darwin_amd64
-            os: macos-13
+            # macos-13 (Intel) was retired Dec 2025; macos-15-intel is the last x64 image.
+            os: macos-15-intel
             rust-target: x86_64-apple-darwin
             os-name: darwin
             arch: amd64
@@ -199,15 +200,23 @@ jobs:
         env:
           VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.vcpkg-triplet }}
         run: |
-          # run-vcpkg sets VCPKG_FORCE_SYSTEM_BINARIES=1 on arm64 hosts (macOS arm64
-          # runners), which forces vcpkg onto the Homebrew system cmake (/opt/homebrew/bin/cmake)
-          # and that segfaults in detect_compiler. Unsetting it alone is not enough: vcpkg still
-          # picks the (version-ok) Homebrew cmake from PATH, and only falls back to a download
-          # when no acceptable tool is found. Force the downloaded binaries instead so the bundled
-          # cmake/ninja are downloaded and used, bypassing the segfaulting Homebrew cmake.
+          # run-vcpkg sets VCPKG_FORCE_SYSTEM_BINARIES=1 on arm64 hosts (macOS arm64 runners).
+          # Unset it and force vcpkg's downloaded tools so the tool versions are deterministic.
           unset VCPKG_FORCE_SYSTEM_BINARIES
           export VCPKG_FORCE_DOWNLOADED_BINARIES=1
-          "$VCPKG_ROOT/vcpkg" install --triplet "${{ matrix.vcpkg-triplet }}" --x-install-root="$VCPKG_ROOT/installed"
+          # install-llvm-action exports DYLD_LIBRARY_PATH=/usr/lib:<llvm>/lib on arm64 macOS
+          # runners. The leading /usr/lib makes cmake resolve its (bundled/Homebrew) dylibs to the
+          # system copies and segfault during compiler detection (detect_compiler). Keep only the
+          # LLVM lib dir so the LLVM clang set via CC/CXX still finds its dylibs.
+          export DYLD_LIBRARY_PATH="${LLVM_PATH}/lib"
+          unset LD_LIBRARY_PATH
+          "$VCPKG_ROOT/vcpkg" install --triplet "${{ matrix.vcpkg-triplet }}" --x-install-root="$VCPKG_ROOT/installed" || {
+            echo "=== detect_compiler out ==="
+            cat "$VCPKG_ROOT/buildtrees/detect_compiler/config-${{ matrix.vcpkg-triplet }}-rel-out.log" 2>/dev/null || true
+            echo "=== detect_compiler err ==="
+            cat "$VCPKG_ROOT/buildtrees/detect_compiler/config-${{ matrix.vcpkg-triplet }}-rel-err.log" 2>/dev/null || true
+            exit 1
+          }
 
       - name: Set SODIUM_LIB_DIR (Windows arm64)
         # libsodium-sys ships no arm64 Windows prebuilt lib; point it at the vcpkg-built one.
