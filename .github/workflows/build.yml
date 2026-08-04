@@ -117,8 +117,14 @@ jobs:
           CROSS_GCC="${{ matrix.cross-gcc }}"
           GCC_PKG="gcc-${CROSS_GCC%-gcc}"
           GXX_PKG="g++-${CROSS_GCC%-gcc}"
-          # armhf is only served from ports.ubuntu.com (archive.ubuntu.com has no armhf at all).
+          # armhf is only served from ports.ubuntu.com (archive/security.ubuntu.com have no armhf at all).
           if [ "${CROSS_ARCH}" == "armhf" ]; then
+          # After dpkg --add-architecture armhf, apt also tries to fetch armhf indexes from the
+          # runner's own amd64 sources, which 404. Restrict those sources to amd64 only.
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          for f in /etc/apt/sources.list.d/*.list; do
+            [ -e "$f" ] && sudo sed -i 's/^deb /deb [arch=amd64] /' "$f"
+          done
           sudo tee /etc/apt/sources.list.d/ports.list >/dev/null <<'EOF'
           deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports/ jammy main universe
           deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main universe
@@ -136,7 +142,9 @@ jobs:
             libxkbcommon-dev libjpeg-turbo8-dev \
             libvpx-dev libaom-dev libopus-dev libyuv-dev \
             libdbus-1-dev libsystemd-dev libsndfile1-dev libmp3lame-dev liblzma-dev"
-          for pkg in $PKGS; do echo "${pkg}:${CROSS_ARCH}"; done | sudo xargs apt-get install -y
+          # Ubuntu 24.04: amd64/i386 dev packages share .gir files -> dpkg conflicts.
+          # --force-overwrite lets libgudev-1.0-dev / libpango1.0-dev coexist (known bug).
+          for pkg in $PKGS; do echo "${pkg}:${CROSS_ARCH}"; done | sudo xargs apt-get install -o Dpkg::Options::=--force-overwrite -y
           # Point the cc/ar crates (e.g. libsodium-sys) at the cross toolchain.
           TARGET_ENV="${{ matrix.rust-target }}"
           TARGET_ENV="${TARGET_ENV//-/_}"
@@ -190,6 +198,11 @@ jobs:
         env:
           VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.vcpkg-triplet }}
         run: |
+          # run-vcpkg sets VCPKG_FORCE_SYSTEM_BINARIES=1 on arm64 hosts (macOS arm64
+          # runners), which forces vcpkg onto the Homebrew system cmake (/opt/homebrew/bin/cmake)
+          # and that segfaults in detect_compiler. Unset it so vcpkg uses its bundled
+          # cmake/ninja instead (same path the passing x64 macOS job takes).
+          unset VCPKG_FORCE_SYSTEM_BINARIES
           "$VCPKG_ROOT/vcpkg" install --triplet "${{ matrix.vcpkg-triplet }}" --x-install-root="$VCPKG_ROOT/installed"
 
       - name: Set SODIUM_LIB_DIR (Windows arm64)

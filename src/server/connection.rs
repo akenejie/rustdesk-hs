@@ -753,7 +753,7 @@ impl Connection {
                                     );
                                 }
                                 _ => {
-                                    allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
+                                    allow_err!(conn.stream.send(&crate::clipboard_file::clip_2_msg(clip)).await);
                                 }
                             }
                         }
@@ -2133,7 +2133,6 @@ impl Connection {
                     #[cfg(windows)]
                     if !crate::platform::is_prelogin()
                         && !err.to_string().contains(crate::platform::EXPLORER_EXE)
-                        && !crate::hbbs_http::sync::is_pro()
                     {
                         allow_err!(tx_from_cm_clone.send(Data::CmErr(err.to_string())));
                     }
@@ -2647,7 +2646,7 @@ impl Connection {
                                 .collect::<Vec<(String, i64)>>(),
                             json!({}),
                         );
-                    } else if let Some(clip) = msg_2_clip(clip) {
+                    } else if let Some(clip) = crate::clipboard_file::msg_2_clip(clip) {
                         #[cfg(target_os = "windows")]
                         {
                             self.send_to_cm(ipc::Data::ClipboardFile(clip));
