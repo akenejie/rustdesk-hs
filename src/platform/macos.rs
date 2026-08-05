@@ -23,6 +23,7 @@ use hbb_common::{
     bail,
     config::{self, Config},
     log,
+    message_proto::{DisplayInfo, Resolution},
     rand,
     sleep,
     sysinfo::*,
@@ -685,7 +686,7 @@ pub fn resolutions(name: &str) -> Vec<Resolution> {
 }
 
 pub fn current_resolution(name: &str) -> ResultType<Resolution> {
-    let display = name.parse::<u32>().map_err(|e| anyhow!(e))?;
+    let display = name.parse::<u32>().map_err(|e| anyhow::anyhow!(e))?;
     unsafe {
         let (mut width, mut height) = (0, 0);
         if NO == MacGetMode(display, &mut width, &mut height) {
@@ -700,7 +701,7 @@ pub fn current_resolution(name: &str) -> ResultType<Resolution> {
 }
 
 pub fn change_resolution_directly(name: &str, width: usize, height: usize) -> ResultType<()> {
-    let display = name.parse::<u32>().map_err(|e| anyhow!(e))?;
+    let display = name.parse::<u32>().map_err(|e| anyhow::anyhow!(e))?;
     unsafe {
         if NO == MacSetMode(display, width as _, height as _, true) {
             bail!("MacSetMode failed");
@@ -761,6 +762,6 @@ impl WakeLock {
         self.0
             .as_mut()
             .map(|h| h.set_display(display))
-            .ok_or(anyhow!("no AwakeHandle"))?
+            .ok_or(anyhow::anyhow!("no AwakeHandle"))?
     }
 }
