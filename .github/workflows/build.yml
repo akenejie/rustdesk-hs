@@ -168,7 +168,14 @@ jobs:
         run: |
           if [ "${{ matrix.cross }}" == "true" ]; then
             MULTIARCH="$(${{ matrix.cross-gcc }} -print-multiarch)"
-            echo "PKG_CONFIG_LIBDIR=/usr/lib/${MULTIARCH}/pkgconfig" >> "$GITHUB_ENV"
+            # Scope to the TARGET triple (pkg-config-rs honors PKG_CONFIG_LIBDIR_<target>).
+            # A generic PKG_CONFIG_LIBDIR leaks the cross lib dir into HOST build scripts
+            # (keepawake -> git2 -> libgit2-sys -> libz-sys probing zlib via pkg-config),
+            # which makes the host link pick up the ARM libz.so; rust-lld then adopts
+            # elf32-littlearm and rejects every x86_64 input.
+            TARGET_SLUG="${{ matrix.rust-target }}"
+            TARGET_SLUG="${TARGET_SLUG//-/_}"
+            echo "PKG_CONFIG_LIBDIR_${TARGET_SLUG}=/usr/lib/${MULTIARCH}/pkgconfig" >> "$GITHUB_ENV"
             # The pkg-config crate refuses cross-compilation unless allowed explicitly.
             echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
           else
