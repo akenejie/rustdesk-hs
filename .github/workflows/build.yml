@@ -282,10 +282,11 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Publish release assets
+    name: Publish release draft
     needs: build
-    # Only run when a repository release is created or on a tag push.
-    if: startsWith(github.ref, 'refs/tags/')
+    # Create/update a draft release on every successful build, tagged or not, so
+    # the warning graphic and note are always attached before anything is published.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -295,9 +296,27 @@ jobs:
         with:
           run-id: ${{ github.run_id }}
           path: dist
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - name: Publish release draft
+        uses: softprops/action-gh-release@v3.0.2
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', env.RUSTDESK_HS_VERSION) }}
+          name: RustDesk Headless-Server ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', env.RUSTDESK_HS_VERSION) }}
+          target_commitish: ${{ github.sha }}
+          draft: true
+          body: |
+            **RustDesk Headless-Server** は、インストール不要・管理者権限不要で、`--port` と `--password` だけで稼働するヘッドレスなリモートデスクトップサーバです。
+
+            An unofficial RustDesk build that turns a machine into a headless remote-desktop server — no installation, no admin rights, just `--port` and `--password`.
+
+            ---
+
+            ![Warning](https://raw.githubusercontent.com/akenejie/rustdesk-hs/master/res/remote-control-warning.jpg)
+
+            > [!WARNING]
+            > **このソフトウェアを実行したパソコンは、リモートから遠隔操作されます。**
+            > The computer on which this software is executed WILL be remotely operated by others.
+            > 所有・管理権限のあるマシンでのみ実行してください。Only run it on machines you own or are authorized to administer.
           files: dist/*/*.tar.gz
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

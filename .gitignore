@@ -17,6 +17,8 @@ cert.pfx
 *png
 *svg
 *jpg
+# warning banner used in the README / release notes
+!res/remote-control-warning.jpg
 sciter.dll
 **pdb
 src/bridge_generated.rs
