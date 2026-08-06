@@ -2116,28 +2116,15 @@ impl Connection {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn try_start_cm_ipc(&mut self) {
+        // The connection manager (cm) is the RustDesk GUI process that shows the
+        // "allow access" dialog and drives sessions. This build is a headless
+        // server and never runs a cm, so starting the cm IPC is dead code: it
+        // emits a misleading "ipc to connection manager exit: Failed to connect
+        // to connection manager" warning on Linux and, on Windows, forwards a
+        // CmErr that disconnects an established session a few seconds after the
+        // client connects. Drop the cm-side channels and do nothing.
         if let Some(p) = self.start_cm_ipc_para.take() {
-            tokio::spawn(async move {
-                #[cfg(windows)]
-                let tx_from_cm_clone = p.tx_from_cm.clone();
-                if let Err(err) = start_ipc(
-                    p.rx_to_cm,
-                    p.tx_from_cm,
-                    p.rx_desktop_ready,
-                    p.tx_cm_stream_ready,
-                )
-                .await
-                {
-                    log::warn!("ipc to connection manager exit: {}", err);
-                    // https://github.com/rustdesk/rustdesk-server-pro/discussions/382#discussioncomment-10525725, cm may start failed
-                    #[cfg(windows)]
-                    if !crate::platform::is_prelogin()
-                        && !err.to_string().contains(crate::platform::EXPLORER_EXE)
-                    {
-                        allow_err!(tx_from_cm_clone.send(Data::CmErr(err.to_string())));
-                    }
-                }
-            });
+            drop(p);
         }
     }
 
@@ -5203,225 +5190,10 @@ impl Connection {
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-// IPC bootstrap summary:
-// - Resolve target CM socket (headless/non-headless, optional UID-scoped path on Linux).
-// - Start CM when missing, then bridge bidirectional messages between this task and CM IPC.
-async fn start_ipc(
-    mut rx_to_cm: mpsc::UnboundedReceiver<ipc::Data>,
-    tx_from_cm: mpsc::UnboundedSender<ipc::Data>,
-    mut _rx_desktop_ready: mpsc::Receiver<()>,
-    tx_stream_ready: mpsc::Sender<()>,
-) -> ResultType<()> {
-    use hbb_common::anyhow::anyhow;
-
-    loop {
-        if !crate::platform::is_prelogin() {
-            break;
-        }
-        sleep(1.).await;
-    }
-    #[cfg(target_os = "linux")]
-    let headless_cm = crate::is_server()
-        && crate::platform::is_headless_allowed()
-        && linux_desktop_manager::is_headless();
-    #[cfg(not(target_os = "linux"))]
-    let headless_cm = false;
-    let mut stream = None;
-    if !headless_cm {
-        if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
-            stream = Some(s);
-        }
-    }
-    if stream.is_none() {
-        #[allow(unused_mut)]
-        #[allow(unused_assignments)]
-        let mut args = vec!["--cm"];
-        #[allow(unused_mut)]
-        #[cfg(target_os = "linux")]
-        let mut user = None;
-
-        // Cm run as user, wait until desktop session is ready.
-        #[cfg(target_os = "linux")]
-        if headless_cm {
-            let mut username = linux_desktop_manager::get_username();
-            loop {
-                if !username.is_empty() {
-                    break;
-                }
-                // `_rx_desktop_ready` is used as a wake-up signal from desktop/session state changes
-                // (for example wait_desktop_cm_ready paths). It is not itself a proof of CM readiness.
-                // TODO:
-                // When `_rx_desktop_ready` is closed, `recv()` returns
-                // `None` immediately and this loop may spin if `username` remains empty.
-                // Keep behavior unchanged for now; if field reports appear, handle `Ok(None)` by
-                // breaking/returning to avoid hot-looping.
-                let _res = timeout(1_000, _rx_desktop_ready.recv()).await;
-                username = linux_desktop_manager::get_username();
-            }
-            let uid = {
-                let username_for_cmd = username.clone();
-                let mut uid_cmd = hbb_common::tokio::process::Command::new("id");
-                // TODO:
-                // Keep current behavior for now to minimize change risk.
-                // If usernames starting with '-' are observed in the field, prefer:
-                // `id -u -- <username>` to avoid option-parsing ambiguity.
-                // Already verified that `id -u -- <username>` works as expected on macOS and Ubuntu 24.04.
-                uid_cmd.arg("-u").arg(&username_for_cmd).kill_on_drop(true);
-                let output = timeout(10_000, uid_cmd.output())
-                    .await
-                    .map_err(|_| anyhow!("Timed out querying uid for {}", username))?
-                    .map_err(|e| anyhow!("Failed to run `id -u {}`: {}", username, e))?;
-                if !output.status.success() {
-                    bail!("Failed to query uid for {}", username);
-                }
-                let output = String::from_utf8_lossy(&output.stdout);
-                let output = output.trim();
-                if output.parse::<u32>().is_err() {
-                    bail!("Invalid uid {}", output);
-                }
-                output.to_string()
-            };
-            user = Some((uid, username));
-            args = vec!["--cm-no-ui"];
-        }
-        #[cfg(target_os = "linux")]
-        let cm_uid: Option<u32> = match &user {
-            Some((uid, _)) => Some(
-                uid.parse::<u32>()
-                    .map_err(|_| anyhow!("Invalid uid {}", uid))?,
-            ),
-            None => None,
-        };
-        #[cfg(target_os = "linux")]
-        if let Some(uid) = cm_uid {
-            if let Ok(s) = crate::ipc::connect_for_uid(1000, uid, "_cm").await {
-                stream = Some(s);
-            }
-        }
-        if stream.is_none() {
-            let run_done;
-            if crate::platform::is_root() {
-                let mut res = Ok(None);
-                for _ in 0..10 {
-                    #[cfg(not(any(target_os = "linux")))]
-                    {
-                        log::debug!("Start cm");
-                        res = crate::platform::run_as_user(args.clone());
-                    }
-                    #[cfg(target_os = "linux")]
-                    {
-                        log::debug!("Start cm");
-                        res = crate::platform::run_as_user(
-                            args.clone(),
-                            user.clone(),
-                            None::<(&str, &str)>,
-                        );
-                    }
-                    if res.is_ok() {
-                        break;
-                    }
-                    log::error!("Failed to run cm: {res:?}");
-                    sleep(1.).await;
-                }
-                if let Some(task) = res? {
-                    super::CHILD_PROCESS.lock().unwrap().push(task);
-                }
-                run_done = true;
-            } else {
-                run_done = false;
-            }
-            if !run_done {
-                log::debug!("Start cm");
-                super::CHILD_PROCESS
-                    .lock()
-                    .unwrap()
-                    .push(crate::run_me(args)?);
-            }
-            for _ in 0..20 {
-                sleep(0.3).await;
-                #[cfg(target_os = "linux")]
-                {
-                    if let Some(uid) = cm_uid {
-                        if let Ok(s) = crate::ipc::connect_for_uid(1000, uid, "_cm").await {
-                            stream = Some(s);
-                            break;
-                        }
-                        continue;
-                    }
-                }
-                if let Ok(s) = crate::ipc::connect(1000, "_cm").await {
-                    stream = Some(s);
-                    break;
-                }
-            }
-        }
-    }
-    if stream.is_none() {
-        bail!("Failed to connect to connection manager");
-    }
-
-    let _res = tx_stream_ready.send(()).await;
-    let mut stream = stream.ok_or(anyhow!("none stream"))?;
-    loop {
-        tokio::select! {
-            res = stream.next() => {
-                match res {
-                    Err(err) => {
-                        return Err(err.into());
-                    }
-                    Ok(Some(data)) => {
-                        match data {
-                            ipc::Data::ClickTime(_)=> {
-                                let ct = CLICK_TIME.load(Ordering::SeqCst);
-                                let data = ipc::Data::ClickTime(ct);
-                                stream.send(&data).await?;
-                            }
-                            // FileBlockFromCM: data is always sent separately via send_raw.
-                            // The data field has #[serde(skip)], so it's empty after deserialization.
-                            // Read the raw data bytes following this message.
-                            //
-                            // Note: Empty data (for empty files) is correctly handled. BytesCodec with
-                            // raw=false adds a length prefix, so next_raw() returns empty BytesMut for
-                            // zero-length frames. This mirrors the WriteBlock pattern below.
-                            ipc::Data::FileBlockFromCM { id, file_num, data: _, compressed, conn_id } => {
-                                let raw_data = stream.next_raw().await?;
-                                tx_from_cm.send(ipc::Data::FileBlockFromCM {
-                                    id,
-                                    file_num,
-                                    data: raw_data.into(),
-                                    compressed,
-                                    conn_id,
-                                })?;
-                            }
-                            _ => {
-                                tx_from_cm.send(data)?;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            res = rx_to_cm.recv() => {
-                match res {
-                    Some(data) => {
-                        if let Data::FS(ipc::FS::WriteBlock{id,
-                            file_num,
-                            data,
-                            compressed}) = data {
-                                stream.send(&Data::FS(ipc::FS::WriteBlock{id, file_num, data: Bytes::new(), compressed})).await?;
-                                stream.send_raw(data).await?;
-                        } else {
-                            stream.send(&data).await?;
-                        }
-                    }
-                    None => {
-                        bail!("expected");
-                    }
-                }
-            }
-        }
-    }
-}
+// The `start_ipc` bootstrap (bridging between this task and the connection
+// manager IPC) was removed: this build is a headless server with no cm, so the
+// IPC connect would always fail (warning on Linux, session-killing CmErr on
+// Windows).
 
 // in case screen is sleep and blank, here to activate it
 fn try_activate_screen() {
