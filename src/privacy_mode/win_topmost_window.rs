@@ -126,7 +126,7 @@ impl PrivacyMode for PrivacyModeImpl {
     fn turn_off_privacy(
         &mut self,
         conn_id: i32,
-        state: Option<PrivacyModeState>,
+        _state: Option<PrivacyModeState>,
     ) -> ResultType<()> {
         self.check_off_conn_id(conn_id)?;
         super::win_input::unhook()?;
@@ -139,19 +139,6 @@ impl PrivacyMode for PrivacyModeImpl {
         // Continue local state cleanup even after stop(); the broker has
         // been torn down, so keeping conn_id/hwnd would leave stale state.
         if self.conn_id != INVALID_PRIVACY_MODE_CONN_ID {
-            // Only publish the off state after the hide message was posted.
-            // Otherwise the peer may receive a success-like state and then a
-            // failed turn-off response for the same request.
-            if hide_result.is_ok() {
-                if let Some(state) = state {
-                    allow_err!(super::set_privacy_mode_state(
-                        conn_id,
-                        state,
-                        PRIVACY_MODE_IMPL.to_string(),
-                        1_000
-                    ));
-                }
-            }
             self.conn_id = INVALID_PRIVACY_MODE_CONN_ID.to_owned();
             self.hwnd = 0;
         }

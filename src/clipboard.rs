@@ -22,8 +22,6 @@ const CLIPBOARD_FORMAT_EXCEL_XML_SPREADSHEET: &'static str = "XML Spreadsheet";
 #[cfg(not(target_os = "android"))]
 lazy_static::lazy_static! {
     static ref ARBOARD_MTX: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
-    // cache the clipboard msg
-    static ref LAST_MULTI_CLIPBOARDS: Arc<Mutex<MultiClipboards>> = Arc::new(Mutex::new(MultiClipboards::new()));
     // For updating in server and getting content in cm.
     // Clipboard on Linux is "server--clients" mode.
     // The clipboard content is owned by the server and passed to the clients when requested.
@@ -60,17 +58,6 @@ const SUPPORTED_FORMATS: &[ClipboardFormat] = &[
     ClipboardFormat::Special(CLIPBOARD_FORMAT_EXCEL_XML_SPREADSHEET),
     ClipboardFormat::Special(RUSTDESK_CLIPBOARD_OWNER_FORMAT),
 ];
-
-#[cfg(not(target_os = "android"))]
-pub fn check_clipboard(
-    ctx: &mut Option<ClipboardContext>,
-    side: ClipboardSide,
-    force: bool,
-) -> Option<Message> {
-    let (msg, clipboards) = read_clipboard_message(ctx, side, force)?;
-    *LAST_MULTI_CLIPBOARDS.lock().unwrap() = clipboards;
-    Some(msg)
-}
 
 #[cfg(target_os = "linux")]
 pub fn peek_clipboard(
@@ -187,7 +174,7 @@ pub fn try_empty_clipboard_files_sync(_side: ClipboardSide, _conn_id: i32) -> Re
         #[cfg(target_os = "linux")]
         {
             use clipboard::platform::unix;
-            if unix::fuse::empty_local_files(_side == ClipboardSide::Client, _conn_id) {
+            if unix::fuse::empty_local_files(false, _conn_id) {
                 ctx.try_empty_clipboard_files(_side);
             }
         }
@@ -478,9 +465,8 @@ impl ClipboardContext {
     }
 
     #[cfg(all(feature = "unix-file-copy-paste", target_os = "linux"))]
-    fn get_file_urls_set_by_rustdesk(data: Vec<ClipboardData>, side: ClipboardSide) -> Vec<String> {
-        let exclude_path =
-            clipboard::platform::unix::fuse::get_exclude_paths(side == ClipboardSide::Client);
+    fn get_file_urls_set_by_rustdesk(data: Vec<ClipboardData>, _side: ClipboardSide) -> Vec<String> {
+        let exclude_path = clipboard::platform::unix::fuse::get_exclude_paths(false);
         data.into_iter()
             .filter_map(|c| match c {
                 ClipboardData::FileUrl(urls) => Some(
@@ -546,53 +532,16 @@ pub fn is_support_multi_clipboard(peer_version: &str, peer_platform: &str) -> bo
     true
 }
 
-#[cfg(not(target_os = "android"))]
-pub fn get_current_clipboard_msg(
-    peer_version: &str,
-    peer_platform: &str,
-    side: ClipboardSide,
-) -> Option<Message> {
-    let mut multi_clipboards = LAST_MULTI_CLIPBOARDS.lock().unwrap();
-    if multi_clipboards.clipboards.is_empty() {
-        let mut ctx = ClipboardContext::new().ok()?;
-        *multi_clipboards = proto::create_multi_clipboards(ctx.get(side, true).ok()?);
-    }
-    if multi_clipboards.clipboards.is_empty() {
-        return None;
-    }
-
-    if is_support_multi_clipboard(peer_version, peer_platform) {
-        let mut msg = Message::new();
-        msg.set_multi_clipboards(multi_clipboards.clone());
-        Some(msg)
-    } else {
-        // Find the first text clipboard and send it.
-        multi_clipboards
-            .clipboards
-            .iter()
-            .find(|c| c.format.enum_value() == Ok(hbb_common::message_proto::ClipboardFormat::Text))
-            .map(|c| {
-                let mut msg = Message::new();
-                msg.set_clipboard(c.clone());
-                msg
-            })
-    }
-}
-
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum ClipboardSide {
     Host,
-    Client,
 }
 
 impl ClipboardSide {
     // 01: the clipboard is owned by the host
     // 10: the clipboard is owned by the client
     fn get_owner_data(&self) -> Vec<u8> {
-        match self {
-            ClipboardSide::Host => vec![0b01],
-            ClipboardSide::Client => vec![0b10],
-        }
+        vec![0b01]
     }
 
     fn is_owner(&self, data: &[u8]) -> bool {
@@ -605,10 +554,7 @@ impl ClipboardSide {
 
 impl std::fmt::Display for ClipboardSide {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClipboardSide::Host => write!(f, "host"),
-            ClipboardSide::Client => write!(f, "client"),
-        }
+        write!(f, "host")
     }
 }
 

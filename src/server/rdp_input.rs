@@ -306,7 +306,6 @@ pub mod client {
         conn: Arc<SyncConnection>,
         session: Path<'static>,
         stream: PwStreamInfo,
-        resolution: (usize, usize),
         scale: Option<f64>,
         position: (f64, f64),
     }
@@ -341,7 +340,6 @@ pub mod client {
                 conn,
                 session,
                 stream,
-                resolution,
                 scale,
                 position: (pos.0 as f64, pos.1 as f64),
             })
