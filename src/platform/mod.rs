@@ -14,6 +14,9 @@ pub mod win_device;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+#[cfg(target_os = "macos")]
+pub mod delegate;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 
@@ -109,6 +112,41 @@ pub fn get_wakelock(_display: bool) -> WakeLock {
 #[inline]
 pub fn is_prelogin() -> bool {
     false
+}
+
+// Note: This method is inefficient on Windows. It will get all the processes.
+// It should only be called when performance is not critical.
+// If we wanted to get the command line ourselves, there would be a lot of new code.
+#[allow(dead_code)]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn get_pids_of_process_with_args<S1: AsRef<str>, S2: AsRef<str>>(
+    name: S1,
+    args: &[S2],
+) -> Vec<Pid> {
+    // This function does not work when the process is 32-bit and the OS is 64-bit Windows,
+    // `process.cmd()` always returns [] in this case.
+    // So we use `windows::get_pids_with_args_by_wmic()` instead.
+    #[cfg(all(target_os = "windows", not(target_pointer_width = "64")))]
+    {
+        return windows::get_pids_with_args_by_wmic(name, args);
+    }
+    #[cfg(not(all(target_os = "windows", not(target_pointer_width = "64"))))]
+    {
+        let name = name.as_ref().to_lowercase();
+        let system = System::new_all();
+        system
+            .processes()
+            .iter()
+            .filter(|(_, process)| {
+                process.name().to_lowercase() == name
+                    && process.cmd().len() == args.len() + 1
+                    && args.iter().enumerate().all(|(i, arg)| {
+                        process.cmd()[i + 1].to_lowercase() == arg.as_ref().to_lowercase()
+                    })
+            })
+            .map(|(&pid, _)| pid)
+            .collect()
+    }
 }
 
 // Note: This method is inefficient on Windows. It will get all the processes.

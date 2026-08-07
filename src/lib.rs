@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 mod keyboard;
 /// cbindgen:ignore
 pub mod platform;
@@ -27,9 +28,15 @@ mod auth_2fa;
 mod clipboard;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod core_main;
+mod lang;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod port_forward;
+mod ui_cm_interface;
 mod ui_interface;
+mod ui_session_interface;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub mod clipboard_file;
 pub mod privacy_mode;
 #[cfg(windows)]
 pub mod virtual_display_manager;
+mod kcp_stream;

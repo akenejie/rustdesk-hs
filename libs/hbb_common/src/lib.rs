@@ -10,9 +10,7 @@ pub use protos::rendezvous as rendezvous_proto;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     fs::File,
-    io::{self, BufRead},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
-    path::Path,
     time::{self, SystemTime, UNIX_EPOCH},
 };
 pub use tokio;
@@ -225,35 +223,11 @@ pub fn get_version_from_url(url: &str) -> String {
     "".to_owned()
 }
 
-pub fn gen_version() {
+pub fn gen_version(compat_version: &str) {
     println!("cargo:rerun-if-changed=Cargo.toml");
     use std::io::prelude::*;
     let mut file = File::create("./src/version.rs").unwrap();
-    let lines: Vec<String> = read_lines("Cargo.toml").unwrap().flatten().collect();
-    let mut version = "1.4.9".to_owned();
-    let mut found = false;
-    let mut in_meta = false;
-    for line in &lines {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_meta = trimmed.starts_with("[package.metadata.rustdesk]");
-        } else if in_meta {
-            let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
-            if ab.len() == 2 && ab[0] == "protocol-version" {
-                version = ab[1].trim_matches('"').to_owned();
-                found = true;
-            }
-        }
-    }
-    if !found {
-        for line in &lines {
-            let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
-            if ab.len() == 2 && ab[0] == "version" {
-                version = ab[1].trim_matches('"').to_owned();
-            }
-        }
-    }
-    file.write_all(format!("pub const VERSION: &str = \"{}\";\n", version).as_bytes())
+    file.write_all(format!("pub const VERSION: &str = \"{compat_version}\";\n").as_bytes())
         .ok();
     // generate build date
     let build_date = format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M"));
@@ -262,14 +236,6 @@ pub fn gen_version() {
     )
     .ok();
     file.sync_all().ok();
-}
-
-fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
-where
-    P: AsRef<Path>,
-{
-    let file = File::open(filename)?;
-    Ok(io::BufReader::new(file).lines())
 }
 
 pub fn is_valid_custom_id(id: &str) -> bool {

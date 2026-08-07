@@ -273,7 +273,11 @@ pub mod unix_file_clip {
         })
     }
 
-    pub fn serve_clip_messages(clip: ClipboardFile, conn_id: i32) -> Vec<Message> {
+    pub fn serve_clip_messages(
+        side: ClipboardSide,
+        clip: ClipboardFile,
+        conn_id: i32,
+    ) -> Vec<Message> {
         log::debug!("got clipfile from client peer");
         match clip {
             ClipboardFile::MonitorReady => {
@@ -336,14 +340,14 @@ pub mod unix_file_clip {
                 }
 
                 log::debug!("parsing file descriptors");
-                match fuse::init_fuse_context(false) {
+                match fuse::init_fuse_context(side == ClipboardSide::Client) {
                     Ok(()) => match fuse::format_data_response_to_urls(
-                        false,
+                        side == ClipboardSide::Client,
                         format_data,
                         conn_id,
                     ) {
                         Ok(files) => {
-                            update_clipboard_files(files, ClipboardSide::Host);
+                            update_clipboard_files(files, side);
                         }
                         Err(e) => {
                             log::error!("failed to parse file descriptors: {:?}", e);
@@ -400,7 +404,8 @@ pub mod unix_file_clip {
                     stream_id,
                     requested_data,
                 };
-                if let Err(e) = fuse::handle_file_content_response(false, response)
+                if let Err(e) =
+                    fuse::handle_file_content_response(side == ClipboardSide::Client, response)
                 {
                     log::error!("failed to handle file contents response: {:?}", e);
                 }

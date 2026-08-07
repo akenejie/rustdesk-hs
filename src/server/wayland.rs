@@ -304,3 +304,14 @@ pub(super) fn get_capturer_for_display(
         );
     }
 }
+
+pub fn common_get_error() -> String {
+    if DISTRO.name.to_uppercase() == "Ubuntu".to_uppercase() {
+        if DISTRO.version_id < "21".to_owned() {
+            return "".to_owned();
+        }
+    } else {
+        // to-do: check other distros
+    }
+    return "".to_owned();
+}

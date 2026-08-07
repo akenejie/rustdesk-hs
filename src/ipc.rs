@@ -11,6 +11,8 @@ use crate::{
     ui_interface::{get_local_option, set_local_option},
 };
 use bytes::Bytes;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub use clipboard::ClipboardFile;
 #[cfg(target_os = "linux")]
 use hbb_common::anyhow;
 use hbb_common::{
@@ -84,9 +86,150 @@ thread_local! {
     static USE_USER_MAIN_IPC: Cell<bool> = Cell::new(false);
 }
 
+#[must_use = "bind this guard to a local variable to keep the IPC scope active"]
+/// Thread-local guard for routing root main IPC to the active user on Linux/macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct UserMainIpcScope {
+    previous: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl UserMainIpcScope {
+    pub(crate) fn new() -> Self {
+        let previous = USE_USER_MAIN_IPC.with(|use_user_main| {
+            let previous = use_user_main.get();
+            use_user_main.set(true);
+            previous
+        });
+        Self { previous }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for UserMainIpcScope {
+    fn drop(&mut self) {
+        USE_USER_MAIN_IPC.with(|use_user_main| use_user_main.set(self.previous));
+    }
+}
+
 #[inline]
 pub async fn connect_service(ms_timeout: u64) -> ResultType<ConnectionTmpl<ConnClient>> {
     connect(ms_timeout, crate::POSTFIX_SERVICE).await
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "t", content = "c")]
+pub enum FS {
+    ReadEmptyDirs {
+        dir: String,
+        include_hidden: bool,
+    },
+    ReadDir {
+        dir: String,
+        include_hidden: bool,
+    },
+    RemoveDir {
+        path: String,
+        id: i32,
+        recursive: bool,
+    },
+    RemoveFile {
+        path: String,
+        id: i32,
+        file_num: i32,
+    },
+    CreateDir {
+        path: String,
+        id: i32,
+    },
+    NewWrite {
+        path: String,
+        id: i32,
+        file_num: i32,
+        files: Vec<(String, u64)>,
+        overwrite_detection: bool,
+        total_size: u64,
+        conn_id: i32,
+    },
+    CancelWrite {
+        id: i32,
+    },
+    WriteBlock {
+        id: i32,
+        file_num: i32,
+        data: Bytes,
+        compressed: bool,
+    },
+    WriteDone {
+        id: i32,
+        file_num: i32,
+    },
+    WriteError {
+        id: i32,
+        file_num: i32,
+        err: String,
+    },
+    WriteOffset {
+        id: i32,
+        file_num: i32,
+        offset_blk: u32,
+    },
+    CheckDigest {
+        id: i32,
+        file_num: i32,
+        file_size: u64,
+        last_modified: u64,
+        is_upload: bool,
+        is_resume: bool,
+    },
+    SendConfirm(Vec<u8>),
+    Rename {
+        id: i32,
+        path: String,
+        new_name: String,
+    },
+    // CM-side file reading operations (Windows only)
+    // These enable Connection Manager to read files and stream them back to Connection
+    ReadFile {
+        path: String,
+        id: i32,
+        file_num: i32,
+        include_hidden: bool,
+        conn_id: i32,
+        overwrite_detection: bool,
+    },
+    CancelRead {
+        id: i32,
+        conn_id: i32,
+    },
+    SendConfirmForRead {
+        id: i32,
+        file_num: i32,
+        skip: bool,
+        offset_blk: u32,
+        conn_id: i32,
+    },
+    ReadAllFiles {
+        path: String,
+        id: i32,
+        include_hidden: bool,
+        conn_id: i32,
+    },
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "t")]
+pub struct ClipboardNonFile {
+    pub compress: bool,
+    pub content: bytes::Bytes,
+    pub content_len: usize,
+    pub next_raw: bool,
+    pub width: i32,
+    pub height: i32,
+    // message.proto: ClipboardFormat
+    pub format: i32,
+    pub special_name: String,
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -150,10 +293,39 @@ pub enum DataPortableService {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "t", content = "c")]
 pub enum Data {
+    Login {
+        id: i32,
+        is_file_transfer: bool,
+        is_view_camera: bool,
+        is_terminal: bool,
+        peer_id: String,
+        name: String,
+        avatar: String,
+        authorized: bool,
+        port_forward: String,
+        keyboard: bool,
+        clipboard: bool,
+        audio: bool,
+        file: bool,
+        file_transfer_enabled: bool,
+        restart: bool,
+        recording: bool,
+        block_input: bool,
+        privacy_mode: bool,
+        from_switch: bool,
+    },
+    ChatMessage {
+        text: String,
+    },
+    SwitchPermission {
+        name: String,
+        enabled: bool,
+    },
     SystemInfo(Option<String>),
     ClickTime(i64),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     MouseMoveTime(i64),
+    Authorize,
     Close,
     #[cfg(windows)]
     SAS,
@@ -165,7 +337,15 @@ pub enum Data {
     ConfirmedKey(Option<(Vec<u8>, Vec<u8>)>),
     RawMessage(Vec<u8>),
     Socks(Option<config::Socks5Server>),
+    FS(FS),
+    Test,
     SyncConfig(Option<Box<(Config, Config2)>>),
+    #[cfg(target_os = "windows")]
+    ClipboardFile(ClipboardFile),
+    ClipboardFileEnabled(bool),
+    #[cfg(target_os = "windows")]
+    ClipboardNonFile(Option<(String, Vec<ClipboardNonFile>)>),
+    PrivacyModeState((i32, PrivacyModeState, String)),
     TestRendezvousServer,
     Deployed,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -178,10 +358,81 @@ pub enum Data {
     Theme(String),
     Language(String),
     Empty,
+    Disconnected,
     DataPortableService(DataPortableService),
     UrlLink(String),
     #[cfg(windows)]
     SyncWinCpuUsage(Option<f64>),
+    FileTransferLog((String, String)),
+    #[cfg(windows)]
+    ControlledSessionCount(usize),
+    CmErr(String),
+    // CM-side file reading responses (Windows only)
+    // These are sent from CM back to Connection when CM handles file reading
+    /// Response to ReadFile: contains initial file list or error
+    ReadJobInitResult {
+        id: i32,
+        file_num: i32,
+        include_hidden: bool,
+        conn_id: i32,
+        /// Serialized protobuf bytes of FileDirectory, or error string
+        result: Result<Vec<u8>, String>,
+    },
+    /// File data block read by CM.
+    ///
+    /// The actual data is sent separately via `send_raw()` after this message to avoid
+    /// JSON encoding overhead for large binary data. This mirrors the `WriteBlock` pattern.
+    ///
+    /// **Protocol:**
+    /// - Sender: `send(FileBlockFromCM{...})` then `send_raw(data)`
+    /// - Receiver: `next()` returns `FileBlockFromCM`, then `next_raw()` returns data bytes
+    ///
+    /// **Note on empty data (e.g., empty files):**
+    /// Empty data is supported. The IPC connection uses `BytesCodec` with `raw=false` (default),
+    /// which prefixes each frame with a length header. So `send_raw(Bytes::new())` sends a
+    /// 1-byte frame (length=0), and `next_raw()` correctly returns an empty `BytesMut`.
+    /// See `libs/hbb_common/src/bytes_codec.rs` test `test_codec2` for verification.
+    FileBlockFromCM {
+        id: i32,
+        file_num: i32,
+        /// Data is sent separately via `send_raw()` to avoid JSON encoding overhead.
+        /// This field is skipped during serialization; sender must call `send_raw()` after sending.
+        /// Receiver must call `next_raw()` and populate this field manually.
+        #[serde(skip)]
+        data: bytes::Bytes,
+        compressed: bool,
+        conn_id: i32,
+    },
+    /// File read completed successfully
+    FileReadDone {
+        id: i32,
+        file_num: i32,
+        conn_id: i32,
+    },
+    /// File read failed with error
+    FileReadError {
+        id: i32,
+        file_num: i32,
+        err: String,
+        conn_id: i32,
+    },
+    /// Digest info from CM for overwrite detection
+    FileDigestFromCM {
+        id: i32,
+        file_num: i32,
+        last_modified: u64,
+        file_size: u64,
+        is_resume: bool,
+        conn_id: i32,
+    },
+    /// Response to ReadAllFiles: recursive directory listing
+    AllFilesResult {
+        id: i32,
+        conn_id: i32,
+        path: String,
+        /// Serialized protobuf bytes of FileDirectory, or error string
+        result: Result<Vec<u8>, String>,
+    },
     CheckHwcodec,
     // Although the key is not necessary, it is used to avoid hardcoding the key.
     WaylandScreencastRestoreToken((String, String)),
@@ -378,15 +629,23 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
 }
 
 pub struct CheckIfRestart {
+    rendezvous_servers: Vec<String>,
+    ws: String,
+    disable_udp: String,
     allow_insecure_tls_fallback: String,
+    api_server: String,
 }
 
 impl CheckIfRestart {
     pub fn new() -> CheckIfRestart {
         CheckIfRestart {
+            rendezvous_servers: Config::get_rendezvous_servers(),
+            ws: Config::get_option(OPTION_ALLOW_WEBSOCKET),
+            disable_udp: Config::get_option(config::keys::OPTION_DISABLE_UDP),
             allow_insecure_tls_fallback: Config::get_option(
                 config::keys::OPTION_ALLOW_INSECURE_TLS_FALLBACK,
             ),
+            api_server: Config::get_option("api-server"),
         }
     }
 }
@@ -599,6 +858,26 @@ async fn handle(data: Data, stream: &mut Connection) {
         }
         Data::TestRendezvousServer => {
             crate::test_rendezvous_server();
+        }
+        #[cfg(windows)]
+        Data::ControlledSessionCount(_) => {
+            allow_err!(
+                stream
+                    .send(&Data::ControlledSessionCount(
+                        crate::Connection::alive_conns().len()
+                    ))
+                    .await
+            );
+        }
+        #[cfg(target_os = "macos")]
+        Data::HasNoActiveConns(None) => {
+            allow_err!(
+                stream
+                    .send(&Data::HasNoActiveConns(Some(
+                        crate::updater::has_no_active_conns()
+                    )))
+                    .await
+            );
         }
         #[cfg(target_os = "linux")]
         Data::TerminalSessionCount(_) => {

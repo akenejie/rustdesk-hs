@@ -518,7 +518,7 @@ impl PrivacyMode for PrivacyModeImpl {
     fn turn_off_privacy(
         &mut self,
         conn_id: i32,
-        _state: Option<PrivacyModeState>,
+        state: Option<PrivacyModeState>,
     ) -> ResultType<()> {
         self.check_off_conn_id(conn_id)?;
         super::win_input::unhook()?;
@@ -529,6 +529,14 @@ impl PrivacyMode for PrivacyModeImpl {
         restore_reg_connectivity(false, true);
 
         if self.conn_id != INVALID_PRIVACY_MODE_CONN_ID {
+            if let Some(state) = state {
+                allow_err!(super::set_privacy_mode_state(
+                    conn_id,
+                    state,
+                    PRIVACY_MODE_IMPL.to_string(),
+                    1_000
+                ));
+            }
             self.conn_id = INVALID_PRIVACY_MODE_CONN_ID.to_owned();
         }
 

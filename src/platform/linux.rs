@@ -19,6 +19,7 @@ use std::{
     process::{Child, Command},
     string::String,
     sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 use wallpaper;
 
@@ -171,6 +172,11 @@ pub fn is_headless_allowed() -> bool {
 pub fn is_login_screen_wayland() -> bool {
     let values = get_values_of_seat0_with_gdm_wayland(&[0, 2]);
     is_gdm_user(&values[1]) && get_display_server_of_session(&values[0]) == DISPLAY_SERVER_WAYLAND
+}
+
+#[inline]
+fn sleep_millis(millis: u64) {
+    std::thread::sleep(Duration::from_millis(millis));
 }
 
 pub fn get_cursor_pos() -> Option<(i32, i32)> {
@@ -550,6 +556,15 @@ pub fn is_root() -> bool {
     crate::username() == "root"
 }
 
+fn is_opensuse() -> bool {
+    if let Ok(res) = run_cmds("cat /etc/os-release | grep opensuse") {
+        if !res.is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn run_as_user<I, K, V>(
     arg: Vec<&str>,
     user: Option<(String, String)>,
@@ -697,6 +712,176 @@ pub fn is_installed() -> bool {
             || p.to_str().unwrap_or_default().starts_with("/nix/store")
     } else {
         false
+    }
+}
+
+/// Get multiple environment variables from a process matching the given criteria.
+/// This version reads /proc directly instead of spawning shell commands.
+///
+/// # Arguments
+/// * `uid` - User ID to filter processes
+/// * `process_pat` - Regex pattern to match process cmdline
+/// * `names` - Environment variable names to retrieve. **Must be <= 64 elements** due to
+///   the internal bitmask used for tie-breaking.
+///
+/// # Panics (debug builds)
+/// Panics if `names.len() > 64`.
+///
+/// # Implementation notes
+/// - Returns values from a *single* best-matching process_pat (for consistency).
+/// - Avoids repeated scanning by parsing `environ` once per process.
+fn get_envs<'a>(
+    uid: &str,
+    process_pat: &str,
+    names: &[&'a str],
+) -> std::collections::HashMap<&'a str, String> {
+    // The tie-breaking logic uses a u64 bitmask, limiting us to 64 variables.
+    debug_assert!(
+        names.len() <= 64,
+        "get_envs: names.len() must be <= 64, got {}",
+        names.len()
+    );
+
+    let empty: std::collections::HashMap<&'a str, String> =
+        names.iter().map(|&n| (n, String::new())).collect();
+
+    let Ok(uid_num) = uid.parse::<u32>() else {
+        return empty;
+    };
+    let Ok(re) = Regex::new(process_pat) else {
+        return empty;
+    };
+
+    // Used for stable tie-breaking when multiple processes match.
+    // Higher bits correspond to earlier entries in `names`.
+    let name_indices: std::collections::HashMap<&'a str, usize> =
+        names.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+
+    let mut best = empty.clone();
+    let mut best_count = 0usize;
+    let mut best_mask: u64 = 0;
+
+    // Iterate /proc to find matching processes
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return best;
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let proc_path = entry.path();
+
+        // Check if process belongs to the specified uid
+        if let Ok(meta) = std::fs::metadata(&proc_path) {
+            use std::os::unix::fs::MetadataExt;
+            if meta.uid() != uid_num {
+                continue;
+            }
+        } else {
+            continue;
+        }
+
+        // Check cmdline matches process pattern
+        let cmdline_path = proc_path.join("cmdline");
+        let Ok(cmdline) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        let cmdline_str = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+        if !re.is_match(&cmdline_str) {
+            continue;
+        }
+
+        // Read environ and extract matching variables
+        let environ_path = proc_path.join("environ");
+        let Ok(environ) = std::fs::read(&environ_path) else {
+            continue;
+        };
+
+        let mut found = empty.clone();
+        let mut found_count = 0usize;
+        let mut found_mask: u64 = 0;
+
+        for part in environ.split(|&b| b == 0) {
+            if part.is_empty() {
+                continue;
+            }
+            let Some(eq) = part.iter().position(|&b| b == b'=') else {
+                continue;
+            };
+            let key_bytes = &part[..eq];
+            let val_bytes = &part[eq + 1..];
+
+            let Ok(key) = std::str::from_utf8(key_bytes) else {
+                continue;
+            };
+            if let Some(slot) = found.get_mut(key) {
+                if slot.is_empty() {
+                    *slot = String::from_utf8_lossy(val_bytes).into_owned();
+                    found_count += 1;
+
+                    if let Some(&idx) = name_indices.get(key) {
+                        let total = names.len();
+                        if total <= 64 {
+                            let bit = 1u64 << (total - 1 - idx);
+                            found_mask |= bit;
+                        }
+                    }
+
+                    if found_count == names.len() {
+                        return found;
+                    }
+                }
+            }
+        }
+
+        if found_count > best_count || (found_count == best_count && found_mask > best_mask) {
+            best = found;
+            best_count = found_count;
+            best_mask = found_mask;
+        }
+    }
+
+    best
+}
+
+/// Deprecated: Use `get_envs` instead.
+///
+/// https://github.com/rustdesk/rustdesk/discussions/11959
+///
+/// **Note**: This function is retained for conservative migration. The plan is to gradually
+/// transition all callers to `get_envs` after it proves stable and reliable. Once `get_envs`
+/// is confirmed to work correctly across all use cases, this function will be removed entirely.
+///
+/// # Arguments
+/// * `name` - Environment variable name to retrieve
+/// * `uid` - User ID to filter processes
+/// * `process` - Process name pattern to match
+///
+/// # Returns
+/// The environment variable value, or empty string if not found
+#[inline]
+fn get_env(name: &str, uid: &str, process: &str) -> String {
+    let cmd = format!("ps -u {} -f | grep -E '{}' | grep -v 'grep' | tail -1 | awk '{{print $2}}' | xargs -I__ cat /proc/__/environ 2>/dev/null | tr '\\0' '\\n' | grep '^{}=' | tail -1 | sed 's/{}=//g'", uid, process, name, name);
+    if let Ok(x) = run_cmds(&cmd) {
+        x.trim_end().to_string()
+    } else {
+        "".to_owned()
+    }
+}
+
+#[inline]
+fn get_env_from_pid(name: &str, pid: &str) -> String {
+    let cmd = format!("cat /proc/{}/environ 2>/dev/null | tr '\\0' '\\n' | grep '^{}=' | tail -1 | sed 's/{}=//g'", pid, name, name);
+    if let Ok(x) = run_cmds(&cmd) {
+        x.trim_end().to_string()
+    } else {
+        "".to_owned()
     }
 }
 
@@ -871,9 +1056,374 @@ pub fn is_xwayland_running() -> bool {
     false
 }
 
+mod desktop {
+    use super::*;
 
-// The handle is held for its RAII side effect (keeping the system awake).
-// It is never read during its lifetime, so release it explicitly on drop.
+    pub const XFCE4_PANEL: &str = "xfce4-panel";
+    pub const SDDM_GREETER: &str = "sddm-greeter";
+
+    // xdg-desktop-portal runs on all Wayland desktops (GNOME, KDE, wlroots, etc.)
+    const XDG_DESKTOP_PORTAL: &str = "xdg-desktop-portal";
+    const XWAYLAND: &str = "Xwayland";
+    const IBUS_DAEMON: &str = "ibus-daemon";
+    const PLASMA_KDED: &str = "kded[0-9]+";
+    const GNOME_GOA_DAEMON: &str = "goa-daemon";
+
+    const ENV_KEY_DISPLAY: &str = "DISPLAY";
+    const ENV_KEY_XAUTHORITY: &str = "XAUTHORITY";
+    const ENV_KEY_WAYLAND_DISPLAY: &str = "WAYLAND_DISPLAY";
+    const ENV_KEY_DBUS_SESSION_BUS_ADDRESS: &str = "DBUS_SESSION_BUS_ADDRESS";
+
+    #[derive(Debug, Clone, Default)]
+    pub struct Desktop {
+        pub sid: String,
+        pub username: String,
+        pub uid: String,
+        pub protocol: String,
+        pub display: String,
+        pub xauth: String,
+        pub home: String,
+        pub dbus: String,
+        pub is_rustdesk_subprocess: bool,
+        pub wl_display: String,
+    }
+
+    impl Desktop {
+        #[inline]
+        pub fn is_wayland(&self) -> bool {
+            self.protocol == DISPLAY_SERVER_WAYLAND
+        }
+
+        #[inline]
+        pub fn is_login_wayland(&self) -> bool {
+            super::is_gdm_user(&self.username) && self.protocol == DISPLAY_SERVER_WAYLAND
+        }
+
+        #[inline]
+        pub fn is_headless(&self) -> bool {
+            self.sid.is_empty() || self.is_rustdesk_subprocess
+        }
+
+        fn get_display_xauth_wayland(&mut self) {
+            for _ in 1..=10 {
+                // Prefer Wayland-related variables first when multiple portal processes match.
+                let mut envs = get_envs(
+                    &self.uid,
+                    XDG_DESKTOP_PORTAL,
+                    &[
+                        ENV_KEY_WAYLAND_DISPLAY,
+                        ENV_KEY_DBUS_SESSION_BUS_ADDRESS,
+                        ENV_KEY_DISPLAY,
+                        ENV_KEY_XAUTHORITY,
+                    ],
+                );
+                self.display = envs.remove(ENV_KEY_DISPLAY).unwrap_or_default();
+                self.xauth = envs.remove(ENV_KEY_XAUTHORITY).unwrap_or_default();
+                self.wl_display = envs.remove(ENV_KEY_WAYLAND_DISPLAY).unwrap_or_default();
+                self.dbus = envs
+                    .remove(ENV_KEY_DBUS_SESSION_BUS_ADDRESS)
+                    .unwrap_or_default();
+                // For pure Wayland sessions, prefer `WAYLAND_DISPLAY`.
+                // NOTE: On some systems (e.g. Ubuntu 25.10), `DISPLAY`/`XAUTHORITY` may exist even when XWayland
+                // is not running, so do NOT treat them as a success condition here.
+                let has_wayland = !self.wl_display.is_empty();
+                let has_dbus = !self.dbus.is_empty();
+                if has_wayland && has_dbus {
+                    return;
+                }
+                sleep_millis(300);
+            }
+        }
+
+        fn get_display_xauth_xwayland(&mut self) {
+            let tray = format!("{} +--tray", crate::get_app_name().to_lowercase());
+            for _ in 1..=10 {
+                let display_proc = vec![
+                    XDG_DESKTOP_PORTAL,
+                    XWAYLAND,
+                    IBUS_DAEMON,
+                    GNOME_GOA_DAEMON,
+                    PLASMA_KDED,
+                    tray.as_str(),
+                ];
+                for proc in display_proc {
+                    self.display = get_env(ENV_KEY_DISPLAY, &self.uid, proc);
+                    self.xauth = get_env(ENV_KEY_XAUTHORITY, &self.uid, proc);
+                    self.wl_display = get_env(ENV_KEY_WAYLAND_DISPLAY, &self.uid, proc);
+                    self.dbus = get_env(ENV_KEY_DBUS_SESSION_BUS_ADDRESS, &self.uid, proc);
+                    if !self.display.is_empty() && !self.xauth.is_empty() {
+                        return;
+                    }
+                }
+                sleep_millis(300);
+            }
+        }
+
+        fn get_display_x11(&mut self) {
+            for _ in 1..=10 {
+                let display_proc = vec![
+                    XWAYLAND,
+                    IBUS_DAEMON,
+                    GNOME_GOA_DAEMON,
+                    PLASMA_KDED,
+                    XFCE4_PANEL,
+                    SDDM_GREETER,
+                ];
+                for proc in display_proc {
+                    self.display = get_env(ENV_KEY_DISPLAY, &self.uid, proc);
+                    if !self.display.is_empty() {
+                        break;
+                    }
+                }
+                if !self.display.is_empty() {
+                    break;
+                }
+                sleep_millis(300);
+            }
+
+            if self.display.is_empty() {
+                self.display = Self::get_display_by_user(&self.username);
+            }
+            if self.display.is_empty() {
+                self.display = ":0".to_owned();
+            }
+            self.display = self
+                .display
+                .replace(&hbb_common::whoami::fallible::hostname().unwrap_or_default(), "")
+                .replace("localhost", "");
+        }
+
+        fn get_home(&mut self) {
+            self.home = "".to_string();
+
+            let cmd = format!(
+                "getent passwd '{}' | awk -F':' '{{print $6}}'",
+                &self.username
+            );
+            self.home = run_cmds_trim_newline(&cmd).unwrap_or(format!("/home/{}", &self.username));
+        }
+
+        fn get_xauth_from_xorg(&mut self) {
+            if let Ok(output) = run_cmds(&format!(
+                "ps -u {} -f | grep 'Xorg' | grep -v 'grep'",
+                &self.uid
+            )) {
+                for line in output.lines() {
+                    let mut auth_found = false;
+
+                    for v in line.split_whitespace() {
+                        if v == "-auth" {
+                            auth_found = true;
+                        } else if auth_found {
+                            if std::path::Path::new(v).is_absolute()
+                                && std::path::Path::new(v).exists()
+                            {
+                                self.xauth = v.to_string();
+                            } else {
+                                if let Some(pid) = line.split_whitespace().nth(1) {
+                                    let mut base_dir: String = String::from("/home"); // default pattern
+                                    let home_dir = get_env_from_pid("HOME", pid);
+                                    if home_dir.is_empty() {
+                                        if let Some(home) = get_user_home_by_name(&self.username) {
+                                            base_dir = home.as_path().to_string_lossy().to_string();
+                                        };
+                                    } else {
+                                        base_dir = home_dir;
+                                    }
+                                    if Path::new(&base_dir).exists() {
+                                        self.xauth = format!("{}/{}", base_dir, v);
+                                    };
+                                } else {
+                                    // unreachable!
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        fn get_xauth_x11(&mut self) {
+            // try by direct access to window manager process by name
+            let tray = format!("{} +--tray", crate::get_app_name().to_lowercase());
+            for _ in 1..=10 {
+                let display_proc = vec![
+                    XWAYLAND,
+                    IBUS_DAEMON,
+                    GNOME_GOA_DAEMON,
+                    PLASMA_KDED,
+                    XFCE4_PANEL,
+                    SDDM_GREETER,
+                    tray.as_str(),
+                ];
+                for proc in display_proc {
+                    self.xauth = get_env("XAUTHORITY", &self.uid, proc);
+                    if !self.xauth.is_empty() {
+                        break;
+                    }
+                }
+                if !self.xauth.is_empty() {
+                    break;
+                }
+                sleep_millis(300);
+            }
+
+            // get from Xorg process, parameter and environment
+            if self.xauth.is_empty() {
+                self.get_xauth_from_xorg();
+            }
+
+            // fallback to default file name
+            if self.xauth.is_empty() {
+                let gdm = format!("/run/user/{}/gdm/Xauthority", self.uid);
+                self.xauth = if std::path::Path::new(&gdm).exists() {
+                    gdm
+                } else {
+                    let username = &self.username;
+                    match get_user_home_by_name(username) {
+                        None => {
+                            if username == "root" {
+                                format!("/{}/.Xauthority", username)
+                            } else {
+                                let tmp = format!("/home/{}/.Xauthority", username);
+                                if std::path::Path::new(&tmp).exists() {
+                                    tmp
+                                } else {
+                                    format!("/var/lib/{}/.Xauthority", username)
+                                }
+                            }
+                        }
+                        Some(home) => {
+                            format!(
+                                "{}/.Xauthority",
+                                home.as_path().to_string_lossy().to_string()
+                            )
+                        }
+                    }
+                };
+            }
+        }
+
+        fn get_display_by_user(user: &str) -> String {
+            // log::debug!("w {}", &user);
+            if let Ok(output) = std::process::Command::new("w").arg(&user).output() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let mut iter = line.split_whitespace();
+                    let b = iter.nth(2);
+                    if let Some(b) = b {
+                        if b.starts_with(":") {
+                            return b.to_owned();
+                        }
+                    }
+                }
+            }
+            // above not work for gdm user
+            //log::debug!("ls -l /tmp/.X11-unix/");
+            let mut last = "".to_owned();
+            if let Ok(output) = std::process::Command::new("ls")
+                .args(vec!["-l", "/tmp/.X11-unix/"])
+                .output()
+            {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    let mut iter = line.split_whitespace();
+                    let user_field = iter.nth(2);
+                    if let Some(x) = iter.last() {
+                        if x.starts_with("X") {
+                            last = x.replace("X", ":").to_owned();
+                            if user_field == Some(&user) {
+                                return last;
+                            }
+                        }
+                    }
+                }
+            }
+            last
+        }
+
+        fn set_is_subprocess(&mut self) {
+            self.is_rustdesk_subprocess = false;
+            let cmd = format!(
+                "ps -ef | grep '{}/xorg.conf' | grep -v grep | wc -l",
+                crate::get_app_name().to_lowercase()
+            );
+            if let Ok(res) = run_cmds(&cmd) {
+                if res.trim() != "0" {
+                    self.is_rustdesk_subprocess = true;
+                }
+            }
+        }
+
+        pub fn refresh(&mut self) {
+            if !self.sid.is_empty() && is_active_and_seat0(&self.sid) {
+                // Xwayland display and xauth may not be available in a short time after login.
+                if is_xwayland_running() && !self.is_login_wayland() {
+                    self.get_display_xauth_xwayland();
+                    self.is_rustdesk_subprocess = false;
+                } else if self.is_wayland() {
+                    self.get_display_xauth_wayland();
+                }
+                return;
+            }
+
+            let seat0_values = get_values_of_seat0_with_gdm_wayland(&[0, 1, 2]);
+            if seat0_values[0].is_empty() {
+                *self = Self::default();
+                self.is_rustdesk_subprocess = false;
+                return;
+            }
+
+            self.sid = seat0_values[0].clone();
+            self.uid = seat0_values[1].clone();
+            self.username = seat0_values[2].clone();
+            self.protocol = get_display_server_of_session(&self.sid).into();
+            if self.is_login_wayland() {
+                self.display = "".to_owned();
+                self.xauth = "".to_owned();
+                self.is_rustdesk_subprocess = false;
+                return;
+            }
+
+            self.get_home();
+            if self.is_wayland() {
+                if is_xwayland_running() {
+                    self.get_display_xauth_xwayland();
+                } else {
+                    self.get_display_xauth_wayland();
+                }
+                self.is_rustdesk_subprocess = false;
+            } else {
+                self.get_display_x11();
+                self.get_xauth_x11();
+                self.set_is_subprocess();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_desktop_env() {
+            let mut d = Desktop::default();
+            d.refresh();
+            if d.username == "root" {
+                assert_eq!(d.home, "/root");
+            } else {
+                if !d.username.is_empty() {
+                    let home = super::super::get_env_var("HOME");
+                    if !home.is_empty() {
+                        assert_eq!(d.home, home);
+                    } else {
+                        //
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub struct WakeLock(Option<keepawake::AwakeHandle>);
 
 impl WakeLock {
@@ -889,11 +1439,6 @@ impl WakeLock {
     }
 }
 
-impl Drop for WakeLock {
-    fn drop(&mut self) {
-        self.0.take();
-    }
-}
 
 pub fn check_autostart_config() -> ResultType<()> {
     // SECURITY: Use trusted home directory lookup via getpwuid instead of $HOME env var

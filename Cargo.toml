@@ -1,16 +1,12 @@
 [package]
 name = "rustdesk-hs"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Akenejie"]
 edition = "2021"
 build= "build.rs"
 description = "RustDesk-Headless-Server (Unofficial) - a stripped, headless host server derived from RustDesk"
 default-run = "rustdesk-hs"
 rust-version = "1.75"
-
-[package.metadata.rustdesk]
-# Version advertised to rustdesk clients during handshake (rustdesk v1.4.9 base).
-protocol-version = "1.4.9"
 
 [lib]
 name = "librustdesk"
@@ -204,7 +200,7 @@ winapi = { version = "0.3", features = [ "winnt", "pdh", "synchapi" ] }
 
 [build-dependencies]
 cc = "1.0"
-chrono = "0.4"
+hbb_common = { path = "libs/hbb_common" }
 os-version = "0.2"
 
 [dev-dependencies]
