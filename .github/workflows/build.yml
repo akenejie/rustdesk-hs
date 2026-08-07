@@ -1,9 +1,9 @@
 name: Build
 
-# Runtime environment controls which registry/overlay bits vcpkg uses.
 env:
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-  VCPKG_COMMIT_ID: "120deac3062162151622ca3ac877409c66bb93c0" # vcpkg baseline, keep in sync with vcpkg.json
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b" # vcpkg baseline, keep in sync with vcpkg.json
+  RUSTDESK_HS_VERSION: "0.1.0"
 
 on:
   workflow_dispatch:
@@ -26,22 +26,83 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - id: linux-x86_64
+          - id: linux_amd64
             os: ubuntu-24.04
-            artifact: rustdesk-linux-x86_64
-          - id: windows-x86_64
+            rust-target: x86_64-unknown-linux-gnu
+            os-name: linux
+            arch: amd64
+          - id: linux_386
+            os: ubuntu-24.04
+            rust-target: i686-unknown-linux-gnu
+            os-name: linux
+            arch: "386"
+            cross: true
+            cross-arch: i386
+            cross-gcc: i686-linux-gnu-gcc
+          - id: linux_arm64
+            # Valid GitHub-hosted label is `ubuntu-24.04-arm`; `ubuntu-24.04-arm64`
+            # matches no runner and the job stays queued forever.
+            os: ubuntu-24.04-arm
+            rust-target: aarch64-unknown-linux-gnu
+            os-name: linux
+            arch: arm64
+          - id: linux_arm
+            # jammy fully publishes armhf in all pockets (noble does not for security/updates/backports).
+            os: ubuntu-22.04
+            rust-target: armv7-unknown-linux-gnueabihf
+            os-name: linux
+            arch: arm
+            cross: true
+            cross-arch: armhf
+            cross-gcc: arm-linux-gnueabihf-gcc
+          - id: windows_amd64
             os: windows-2022
-            artifact: rustdesk-windows-x86_64
-          - id: macos-x86_64
-            os: macos-13
-            artifact: rustdesk-macos-x86_64
+            rust-target: x86_64-pc-windows-msvc
+            os-name: windows
+            arch: amd64
+            vcpkg-triplet: x64-windows-static
+          - id: windows_386
+            os: windows-2022
+            rust-target: i686-pc-windows-msvc
+            os-name: windows
+            arch: "386"
+            vcpkg-triplet: x86-windows-static
+            # libsodium-sys 0.2.7 picks its MSVC prebuilt via compile-time cfg! on the build
+            # script, which is built for the x64 host even when cross-compiling to i686. That
+            # selects msvc/x64/... (LNK4272) and breaks the link, so use the vcpkg-built x86
+            # lib instead (vcpkg.json builds libsodium for x86-windows-static for this reason).
+            sodium-lib-dir: true
+          - id: windows_arm64
+            os: windows-2022
+            rust-target: aarch64-pc-windows-msvc
+            os-name: windows
+            arch: arm64
+            vcpkg-triplet: arm64-windows-static
+            sodium-lib-dir: true
+          - id: darwin_amd64
+            # macos-13 (Intel) was retired Dec 2025; macos-15-intel is the last x64 image.
+            os: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            os-name: darwin
+            arch: amd64
+            vcpkg-triplet: x64-osx
+          - id: darwin_arm64
+            os: macos-14
+            rust-target: aarch64-apple-darwin
+            os-name: darwin
+            arch: arm64
+            vcpkg-triplet: arm64-osx
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # bindgen (used by magnum-opus etc.) needs libclang.
+      # bindgen (used by magnum-opus etc.) needs libclang. macOS needs no LLVM download:
+      # Xcode ships clang and libclang, which clang-sys finds via `xcode-select --print-path`.
+      # The action also exports DYLD_LIBRARY_PATH=/usr/lib:<llvm>/lib on arm64 macOS, which
+      # segfaults vcpkg's cmake and breaks Xcode's cc, so skip it on macOS entirely.
       - name: Install LLVM (libclang for bindgen)
+        if: runner.os != 'macOS'
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "16"
@@ -61,9 +122,88 @@ jobs:
             libvpx-dev libaom-dev libopus-dev libyuv-dev \
             libdbus-1-dev libsystemd-dev libsndfile1-dev libmp3lame-dev liblzma-dev
 
+      - name: (Linux) add cross-compile toolchain
+        if: runner.os == 'Linux' && matrix.cross
+        run: |
+          CROSS_ARCH="${{ matrix.cross-arch }}"
+          CROSS_GCC="${{ matrix.cross-gcc }}"
+          GCC_PKG="gcc-${CROSS_GCC%-gcc}"
+          GXX_PKG="g++-${CROSS_GCC%-gcc}"
+          # armhf is only served from ports.ubuntu.com (archive/security.ubuntu.com have no armhf at all).
+          if [ "${CROSS_ARCH}" == "armhf" ]; then
+          # After dpkg --add-architecture armhf, apt also tries to fetch armhf indexes from the
+          # runner's own amd64 sources (archive/security.ubuntu.com have no armhf), which 404.
+          # Restrict only the main sources.list to amd64, and skip entries that already carry an
+          # [arch=...] option (e.g. microsoft-prod.list) to avoid malforming them.
+          sudo sed -i '/^deb \[/!s/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          sudo tee /etc/apt/sources.list.d/ports.list >/dev/null <<'EOF'
+          deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports/ jammy main universe
+          deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main universe
+          deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports/ jammy-security main universe
+          EOF
+          fi
+          sudo dpkg --add-architecture "${CROSS_ARCH}"
+          sudo apt-get -y update
+          sudo apt-get install -y "${GCC_PKG}" "${GXX_PKG}"
+          PKGS="libpam0g-dev libasound2-dev libunwind-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgtk-3-dev libpulse-dev libva-dev libvdpau-dev \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libjpeg-turbo8-dev \
+            libvpx-dev libaom-dev libopus-dev libyuv-dev \
+            libdbus-1-dev libsystemd-dev libsndfile1-dev libmp3lame-dev liblzma-dev"
+          # Ubuntu 24.04: amd64/i386 dev packages share .gir files -> dpkg conflicts.
+          # --force-overwrite lets libgudev-1.0-dev / libpango1.0-dev coexist (known bug).
+          for pkg in $PKGS; do echo "${pkg}:${CROSS_ARCH}"; done | sudo xargs apt-get install -o Dpkg::Options::=--force-overwrite -y
+          # Point the cc/ar crates (e.g. libsodium-sys) at the cross toolchain.
+          TARGET_ENV="${{ matrix.rust-target }}"
+          TARGET_ENV="${TARGET_ENV//-/_}"
+          echo "CC_${TARGET_ENV}=${CROSS_GCC}" >> "$GITHUB_ENV"
+          echo "AR_${TARGET_ENV}=${CROSS_GCC%-gcc}-ar" >> "$GITHUB_ENV"
+
+      - name: (Linux) configure pkg-config for target
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" == "true" ]; then
+            MULTIARCH="$(${{ matrix.cross-gcc }} -print-multiarch)"
+            # Scope to the TARGET triple (pkg-config-rs honors PKG_CONFIG_LIBDIR_<target>).
+            # A generic PKG_CONFIG_LIBDIR leaks the cross lib dir into HOST build scripts
+            # (keepawake -> git2 -> libgit2-sys -> libz-sys probing zlib via pkg-config),
+            # which makes the host link pick up the ARM libz.so; rust-lld then adopts
+            # elf32-littlearm and rejects every x86_64 input.
+            TARGET_SLUG="${{ matrix.rust-target }}"
+            TARGET_SLUG="${TARGET_SLUG//-/_}"
+            echo "PKG_CONFIG_LIBDIR_${TARGET_SLUG}=/usr/lib/${MULTIARCH}/pkgconfig" >> "$GITHUB_ENV"
+            # The pkg-config crate refuses cross-compilation unless allowed explicitly.
+            echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
+          else
+            MULTIARCH="$(gcc -print-multiarch)"
+          fi
+          # Ubuntu's libyuv-dev does not ship libyuv.pc; generate one for this target.
+          mkdir -p "$RUNNER_TEMP/ci-pc"
+          cat > "$RUNNER_TEMP/ci-pc/libyuv.pc" <<EOF
+          prefix=/usr
+          exec_prefix=\${prefix}
+          libdir=\${exec_prefix}/lib/${MULTIARCH}
+          includedir=\${prefix}/include
+
+          Name: libyuv
+          Description: libyuv
+          Version: 0.0.0
+          Libs: -L\${libdir} -lyuv
+          Cflags: -I\${includedir}
+          EOF
+          # PKG_CONFIG_LIBDIR replaces the default search path, which also drops the
+          # arch-independent /usr/share/pkgconfig dir. x11.pc Requires: xproto kbproto
+          # (both arch: all, installed there), so without this pkg-config cannot resolve
+          # x11.pc on cross builds (linux_386). Add it back via PKG_CONFIG_PATH.
+          echo "PKG_CONFIG_PATH=${RUNNER_TEMP}/ci-pc:/usr/share/pkgconfig" >> "$GITHUB_ENV"
+
       - name: (macOS) Install system prerequisites
         if: runner.os == 'macOS'
-        run: brew install nasm yasm automake autoconf libtool
+        run: brew install nasm yasm automake autoconf libtool ninja
 
       # vcpkg provides the codec/system libs on Windows/macOS where there is
       # no system package manager. On Linux the crates use pkg-config instead,
@@ -72,67 +212,81 @@ jobs:
         if: runner.os != 'Linux'
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgDirectory: ${{ runner.os == 'Windows' && 'C:\vcpkg' || '/opt/artifacts/vcpkg' }}
+          # /opt/artifacts is not writable on macOS runners; use runner.temp instead.
+          vcpkgDirectory: ${{ runner.os == 'Windows' && 'C:\vcpkg' || format('{0}/vcpkg', runner.temp) }}
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
 
       - name: (Windows/macOS) Install vcpkg dependencies
         if: runner.os != 'Linux'
         shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.vcpkg-triplet }}
         run: |
-          "$VCPKG_ROOT/vcpkg" install --x-install-root="$VCPKG_ROOT/installed"
+          # run-vcpkg sets VCPKG_FORCE_SYSTEM_BINARIES=1 on arm64 hosts (macOS arm64 runners).
+          # Unset it and force vcpkg's downloaded tools so the tool versions are deterministic.
+          unset VCPKG_FORCE_SYSTEM_BINARIES
+          export VCPKG_FORCE_DOWNLOADED_BINARIES=1
+          # install-llvm-action (now skipped on macOS) exported DYLD_LIBRARY_PATH=/usr/lib:<llvm>/lib
+          # on arm64 macOS. The leading /usr/lib made cmake resolve its bundled dylibs to the system
+          # copies and segfault in detect_compiler; pointing it at <llvm>/lib instead broke Xcode's cc
+          # (LLVM libc++ lacks Apple's weak __ZnwmSt19__type_descriptor_t symbols). With LLVM gone on
+          # macOS, unset the vars so cmake/cc/ninja resolve their dylibs normally. Harmless on Windows.
+          unset DYLD_LIBRARY_PATH
+          unset LD_LIBRARY_PATH
+          "$VCPKG_ROOT/vcpkg" install --triplet "${{ matrix.vcpkg-triplet }}" --x-install-root="$VCPKG_ROOT/installed" || {
+            echo "=== detect_compiler out ==="
+            cat "$VCPKG_ROOT/buildtrees/detect_compiler/config-${{ matrix.vcpkg-triplet }}-rel-out.log" 2>/dev/null || true
+            echo "=== detect_compiler err ==="
+            cat "$VCPKG_ROOT/buildtrees/detect_compiler/config-${{ matrix.vcpkg-triplet }}-rel-err.log" 2>/dev/null || true
+            exit 1
+          }
+
+      - name: Set SODIUM_LIB_DIR (Windows arm64 / 386)
+        # libsodium-sys ships no arm64 Windows prebuilt, and its i686 cross-build would pick
+        # the x64 host-config prebuilt. Point it at the vcpkg-built lib for these two targets.
+        if: runner.os == 'Windows' && matrix.sodium-lib-dir
+        shell: bash
+        run: echo "SODIUM_LIB_DIR=$VCPKG_ROOT/installed/${{ matrix.vcpkg-triplet }}/lib" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
-
-      - name: Set versions as environment variables
-        shell: bash
-        run: |
-          echo "RUSTDESK_VERSION=${RUSTDESK_VERSION:-${{ github.ref_name }}}" >> "$GITHUB_ENV"
+          targets: ${{ matrix.rust-target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust-target }}
 
       - name: Build (release)
         shell: bash
         run: |
-          cargo build --release --bin rustdesk-hs
+          cargo build --release --target ${{ matrix.rust-target }} --bin rustdesk-hs
 
-      - name: (Linux) Prepare portable artifact
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p dist
-          cp target/release/rustdesk-hs dist/rustdesk-hs
-          tar -czf "${{ matrix.artifact }}.tar.gz" -C dist rustdesk-hs
-
-      - name: (Windows) Prepare portable artifact
-        if: runner.os == 'Windows'
+      - name: Prepare artifact
         shell: bash
         run: |
           mkdir -p dist
-          cp target/release/rustdesk-hs.exe dist/rustdesk-hs.exe
-          tar -czf "${{ matrix.artifact }}.tar.gz" -C dist rustdesk-hs.exe
-
-      - name: (macOS) Prepare portable artifact
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p dist
-          cp target/release/rustdesk-hs dist/rustdesk-hs
-          tar -czf "${{ matrix.artifact }}.tar.gz" -C dist rustdesk-hs
+          EXE=""
+          if [ "${{ matrix.os-name }}" == "windows" ]; then EXE=".exe"; fi
+          NAME="rustdesk-hs_v${RUSTDESK_HS_VERSION}_${{ matrix.os-name }}_${{ matrix.arch }}"
+          cp "target/${{ matrix.rust-target }}/release/rustdesk-hs${EXE}" "dist/${NAME}${EXE}"
+          tar -czf "${NAME}.tar.gz" -C dist "${NAME}${EXE}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
+          name: ${{ matrix.os-name }}-${{ matrix.arch }}
+          path: rustdesk-hs_v${{ env.RUSTDESK_HS_VERSION }}_${{ matrix.os-name }}_${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   release:
-    name: Publish release assets
+    name: Publish release draft
     needs: build
-    # Only run when a repository release is created or on a tag push.
-    if: startsWith(github.ref, 'refs/tags/')
+    # Create/update a draft release on every successful build, tagged or not, so
+    # the warning graphic and note are always attached before anything is published.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -142,9 +296,27 @@ jobs:
         with:
           run-id: ${{ github.run_id }}
           path: dist
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - name: Publish release draft
+        uses: softprops/action-gh-release@v3.0.2
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', env.RUSTDESK_HS_VERSION) }}
+          name: RustDesk Headless-Server ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', env.RUSTDESK_HS_VERSION) }}
+          target_commitish: ${{ github.sha }}
+          draft: true
+          body: |
+            **RustDesk Headless-Server** は、インストール不要・管理者権限不要で、`--port` と `--password` だけで稼働するヘッドレスなリモートデスクトップサーバです。
+
+            An unofficial RustDesk build that turns a machine into a headless remote-desktop server — no installation, no admin rights, just `--port` and `--password`.
+
+            ---
+
+            ![Warning](https://raw.githubusercontent.com/akenejie/rustdesk-hs/master/res/remote-control-warning.jpg)
+
+            > [!WARNING]
+            > **このソフトウェアを実行したパソコンは、リモートから遠隔操作されます。**
+            > The computer on which this software is executed WILL be remotely operated by others.
+            > 所有・管理権限のあるマシンでのみ実行してください。Only run it on machines you own or are authorized to administer.
           files: dist/*/*.tar.gz
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

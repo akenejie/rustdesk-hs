@@ -1,10 +1,6 @@
 use crate::ui_interface::get_option;
 #[cfg(windows)]
-use crate::{
-    display_service,
-    ipc::{connect, Data},
-    platform::is_installed,
-};
+use crate::{display_service, platform::is_installed};
 #[cfg(windows)]
 use hbb_common::tokio;
 use hbb_common::{anyhow::anyhow, bail, lazy_static, tokio::sync::oneshot, ResultType};
@@ -137,7 +133,8 @@ pub type PrivacyModeCreator = fn(impl_key: &str) -> Box<dyn PrivacyMode>;
 lazy_static::lazy_static! {
     static ref PRIVACY_MODE_CREATOR: Arc<Mutex<HashMap<&'static str, PrivacyModeCreator>>> = {
         #[cfg(not(windows))]
-        let map: HashMap<&'static str, PrivacyModeCreator> = HashMap::new();
+        #[allow(unused_mut)] // needed by the macos block below
+        let mut map: HashMap<&'static str, PrivacyModeCreator> = HashMap::new();
         #[cfg(target_os = "macos")]
         {
             map.insert(macos::PRIVACY_MODE_IMPL, |impl_key: &str| {
@@ -309,19 +306,6 @@ pub fn check_on_conn_id(conn_id: i32) -> Option<ResultType<bool>> {
             .as_ref()?
             .check_on_conn_id(conn_id),
     )
-}
-
-#[cfg(windows)]
-#[tokio::main(flavor = "current_thread")]
-async fn set_privacy_mode_state(
-    conn_id: i32,
-    state: PrivacyModeState,
-    impl_key: String,
-    ms_timeout: u64,
-) -> ResultType<()> {
-    let mut c = connect(ms_timeout, "_cm").await?;
-    c.send(&Data::PrivacyModeState((conn_id, state, impl_key)))
-        .await
 }
 
 pub fn get_supported_privacy_mode_impl() -> Vec<(&'static str, &'static str)> {

@@ -103,8 +103,6 @@ impl StateWindowFocus {
 struct Input {
     conn: i32,
     time: i64,
-    x: i32,
-    y: i32,
 }
 
 const KEY_CHAR_START: u64 = 9999;
@@ -471,11 +469,6 @@ fn set_relative_mouse_active(conn: i32, active: bool) {
     }
 }
 
-#[inline]
-fn is_relative_mouse_active(conn: i32) -> bool {
-    RELATIVE_MOUSE_CONNS.lock().unwrap().contains(&conn)
-}
-
 /// Clears the relative mouse mode state for a connection.
 ///
 /// This must be called when an authenticated connection is dropped (during connection teardown)
@@ -487,10 +480,6 @@ pub(crate) fn clear_relative_mouse_active(conn: i32) {
 }
 
 static EXITING: AtomicBool = AtomicBool::new(false);
-
-const MOUSE_MOVE_PROTECTION_TIMEOUT: Duration = Duration::from_millis(1_000);
-// Actual diff of (x,y) is (1,1) here. But 5 may be tolerant.
-const MOUSE_ACTIVE_DISTANCE: i32 = 5;
 
 static RECORD_CURSOR_POS_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -939,12 +928,6 @@ pub fn update_latest_input_cursor_time(conn: i32) {
     lock.time = get_time();
 }
 
-#[inline]
-fn get_last_input_cursor_pos() -> (i32, i32) {
-    let lock = LATEST_PEER_INPUT_CURSOR.lock().unwrap();
-    (lock.x, lock.y)
-}
-
 // check if mouse is moved by the controlled side user to make controlled side has higher mouse priority than remote.
 fn active_mouse_(_conn: i32) -> bool {
     true
@@ -1101,8 +1084,6 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
             *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
                 conn,
                 time: get_time(),
-                x: mx,
-                y: my,
             };
         }
         // MOUSE_TYPE_MOVE_RELATIVE: Relative mouse movement for gaming/3D applications.
@@ -1121,13 +1102,11 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
                 .y
                 .clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA);
             en.mouse_move_relative(dx, dy);
-            // Get actual cursor position after relative movement for tracking
-            if let Some((x, y)) = crate::get_cursor_pos() {
+            // Record the input time so the cursor position is not echoed back to this peer.
+            if crate::get_cursor_pos().is_some() {
                 *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
                     conn,
                     time: get_time(),
-                    x,
-                    y,
                 };
             }
         }

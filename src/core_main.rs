@@ -47,11 +47,7 @@ pub fn core_main() -> Option<Vec<String>> {
     if let Some(cmd) = args.first().map(String::as_str) {
         match cmd {
             "--version" => {
-                println!(
-                    "RustDesk Headless-Server {} (based on RustDesk {})",
-                    env!("CARGO_PKG_VERSION"),
-                    crate::VERSION
-                );
+                println!("{}", crate::VERSION);
                 return None;
             }
             "--build-date" => {
