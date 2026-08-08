@@ -705,6 +705,8 @@ fn run(vs: VideoService) -> ResultType<()> {
         {
             if crate::platform::windows::desktop_changed()
                 && !crate::portable_service::client::running()
+                && !(crate::platform::windows::is_root()
+                    || crate::platform::windows::is_elevated(None).unwrap_or(false))
             {
                 bail!("Desktop changed");
             }

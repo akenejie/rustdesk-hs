@@ -173,7 +173,17 @@ pub fn get_cursor() -> ResultType<Option<u64>> {
         let mut ci: CURSORINFO = mem::MaybeUninit::uninit().assume_init();
         ci.cbSize = std::mem::size_of::<CURSORINFO>() as _;
         if crate::portable_service::client::get_cursor_info(&mut ci) == FALSE {
-            return Err(io::Error::last_os_error().into());
+            let err = io::Error::last_os_error();
+            // When running with elevated privileges, `GetCursorInfo` may fail with
+            // `ERROR_ACCESS_DENIED` if the current desktop is not the input one
+            // (e.g. secure desktop or a session without the input desktop).
+            // Treat it as "no cursor" for this cycle instead of failing the service.
+            if (is_root() || is_elevated(None).unwrap_or(false))
+                && err.raw_os_error() == Some(ERROR_ACCESS_DENIED as _)
+            {
+                return Ok(None);
+            }
+            return Err(err.into());
         }
         if ci.flags & CURSOR_SHOWING == 0 {
             Ok(None)
