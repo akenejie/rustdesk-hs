@@ -59,7 +59,7 @@ const SUPPORTED_FORMATS: &[ClipboardFormat] = &[
     ClipboardFormat::Special(RUSTDESK_CLIPBOARD_OWNER_FORMAT),
 ];
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "android"))]
 pub fn peek_clipboard(
     ctx: &mut Option<ClipboardContext>,
     side: ClipboardSide,

@@ -401,9 +401,9 @@ impl Connection {
                 rx
             };
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        let (_tx_cm_stream_ready, _rx_cm_stream_ready) = mpsc::channel(1);
+        let (_tx_cm_stream_ready, _rx_cm_stream_ready) = mpsc::channel::<()>(1);
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        let (_tx_desktop_ready, _rx_desktop_ready) = mpsc::channel(1);
+        let (_tx_desktop_ready, _rx_desktop_ready) = mpsc::channel::<()>(1);
         #[cfg(target_os = "linux")]
         let linux_headless_handle =
             LinuxHeadlessHandle::new(_rx_cm_stream_ready, _tx_desktop_ready);

@@ -179,6 +179,7 @@ impl Handler {
 
     fn get_clipboard_msg(&mut self) -> Option<Message> {
         let msg = crate::clipboard::peek_clipboard(&mut self.ctx, ClipboardSide::Host, false)?;
+        #[cfg(target_os = "linux")]
         if should_skip_wayland_clipboard_sync(&msg) {
             log::debug!("Skip clipboard sync for recent Wayland keyboard injection");
             return None;
